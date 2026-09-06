@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""
+pmem: Universal Smart, Fast & Beautiful Process Memory Explorer & RAM Profiler
+
+Features:
+- Detects all processes and sorts them by RAM usage (RSS) with colorful visual meters
+- System RAM and Swap summary gauges with detailed breakdown
+- Grouping mode (-g, --group) to aggregate multi-process applications (Chrome, Firefox, Electron, etc.)
+- Interactive FZF explorer (-i, --fzf) with deep inspection preview and process management
+- Live auto-refresh watch dashboard (-w, --watch [interval])
+- Powerful search and filtering by process name, user, or command line
+- Machine-readable JSON export mode (--json)
+- Automatic ANSI color detection with pipeline support
+"""
+import sys
+import os
+import re
+import time
+import json
+import signal
+import shutil
+import datetime
+import argparse
+import subprocess
+
+try:
+    import psutil
+except ImportError:
+    print("Error: 'psutil' is required. Install it using: sudo pacman -S python-psutil", file=sys.stderr)
+    sys.exit(1)
+
+# Handle SIGPIPE cleanly for unix pipelines
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+# --- ANSI Color & Styling ---
+ESC = "\033"
+RESET = f"{ESC}[0m"
+BOLD = f"{ESC}[1m"
+DIM = f"{ESC}[2m"
+ITALIC = f"{ESC}[3m"
+UNDERLINE = f"{ESC}[4m"
+
+# Palette
+RED = f"{ESC}[31m"
+BRIGHT_RED = f"{ESC}[91m"
+GREEN = f"{ESC}[32m"
+BRIGHT_GREEN = f"{ESC}[92m"
+YELLOW = f"{ESC}[33m"
+BRIGHT_YELLOW = f"{ESC}[93m"
+ORANGE = f"{ESC}[38;5;208m"
+BLUE = f"{ESC}[34m"
+MAGENTA = f"{ESC}[35m"
+CYAN = f"{ESC}[36m"
+ELECTRIC_CYAN = f"{ESC}[38;5;45m"
+SKY_BLUE = f"{ESC}[38;5;81m"
+PURPLE = f"{ESC}[38;5;141m"
+GRAY = f"{ESC}[90m"
+WHITE = f"{ESC}[97m"
+MUTED = f"{ESC}[38;5;244m"
+BAR_EMPTY = f"{ESC}[38;5;238m"
+
+def disable_colors():
+    global RESET, BOLD, DIM, ITALIC, UNDERLINE, RED, BRIGHT_RED, GREEN, BRIGHT_GREEN
+    global YELLOW, BRIGHT_YELLOW, ORANGE, BLUE, MAGENTA, CYAN, ELECTRIC_CYAN, SKY_BLUE, PURPLE, GRAY, WHITE, MUTED, BAR_EMPTY
+    RESET = BOLD = DIM = ITALIC = UNDERLINE = ""
+    RED = BRIGHT_RED = GREEN = BRIGHT_GREEN = YELLOW = BRIGHT_YELLOW = ORANGE = ""
+    BLUE = MAGENTA = CYAN = ELECTRIC_CYAN = SKY_BLUE = PURPLE = GRAY = WHITE = MUTED = BAR_EMPTY = ""
+
+def format_bytes(b):
+    if b is None or b < 0:
+        return "0 B"
+    if b >= 1024**4:
+        return f"{b / (1024**4):.2f} TB"
+    if b >= 1024**3:
+        return f"{b / (1024**3):.2f} GB"
+    if b >= 1024**2:
+        return f"{b / (1024**2):.1f} MB"
+    if b >= 1024:
+        return f"{b / 1024:.1f} KB"
+    return f"{b} B"
+
+def color_ram(b, pct=0.0, width=0):
+    txt = format_bytes(b)
+    aligned = f"{txt:>{width}}" if width > 0 else txt
+    if b >= 1024**3 or pct >= 8.0:
+        return f"{BOLD}{BRIGHT_RED}{aligned}{RESET}"
+    elif b >= 500 * (1024**2) or pct >= 4.0:
+        return f"{BOLD}{ORANGE}{aligned}{RESET}"
+    elif b >= 150 * (1024**2) or pct >= 1.5:
+        return f"{BRIGHT_YELLOW}{aligned}{RESET}"
+    elif b >= 40 * (1024**2) or pct >= 0.5:
+        return f"{ELECTRIC_CYAN}{aligned}{RESET}"
+    elif b >= 5 * (1024**2):
+        return f"{GREEN}{aligned}{RESET}"
+    else:
+        return f"{GRAY}{aligned}{RESET}"
+
+CURRENT_USER = os.environ.get("USER") or (os.getlogin() if hasattr(os, "getlogin") else None) or ""
+
+def color_user(uname, width=12):
+    user_raw = str(uname) if uname is not None else "unknown"
+    if width > 0 and len(user_raw) > (width - 1):
+        user_raw = user_raw[:width - 2] + "…"
+    padded = f"{user_raw:<{width}}" if width > 0 else user_raw
+
+    u_lower = user_raw.lower()
+    if CURRENT_USER and u_lower == CURRENT_USER.lower():
+        return f"{BOLD}{BRIGHT_GREEN}{padded}{RESET}"
+    elif u_lower in ["root"]:
+        return f"{BOLD}{BRIGHT_RED}{padded}{RESET}"
+    elif user_raw.isdigit():
+        return f"{BOLD}{BRIGHT_YELLOW}{padded}{RESET}"
+    elif u_lower in ["systemd", "daemon", "dbus", "nobody", "polkitd", "bin", "sys"]:
+        return f"{PURPLE}{padded}{RESET}"
+    else:
+        return f"{SKY_BLUE}{padded}{RESET}"
+
+def color_cpu(cpu_pct):
+    if cpu_pct >= 50.0:
+        return f"{BOLD}{BRIGHT_RED}{cpu_pct:5.1f}%{RESET}"
+    elif cpu_pct >= 20.0:
+        return f"{BOLD}{ORANGE}{cpu_pct:5.1f}%{RESET}"
+    elif cpu_pct >= 5.0:
+        return f"{BOLD}{BRIGHT_YELLOW}{cpu_pct:5.1f}%{RESET}"
+    elif cpu_pct >= 1.0:
+        return f"{ELECTRIC_CYAN}{cpu_pct:5.1f}%{RESET}"
+    elif cpu_pct > 0.0:
+        return f"{SKY_BLUE}{cpu_pct:5.1f}%{RESET}"
+    else:
+        return f"{DIM}{GRAY}{cpu_pct:5.1f}%{RESET}"
+
+def render_mini_bar(percent, width=8):
+    p = max(0.0, min(100.0, percent))
+    filled = int(round((p / 100.0) * width))
+    filled = min(width, max(0, filled))
+    empty = width - filled
+
+    if p >= 8.0:
+        bar_col = BRIGHT_RED
+    elif p >= 4.0:
+        bar_col = ORANGE
+    elif p >= 1.5:
+        bar_col = BRIGHT_YELLOW
+    elif p >= 0.5:
+        bar_col = ELECTRIC_CYAN
+    else:
+        bar_col = GREEN
+
+    return f"{bar_col}{'█' * filled}{BAR_EMPTY}{'░' * empty}{RESET} {p:4.1f}%"
+
+def render_gauge(used, total, width=20):
+    if total <= 0:
+        pct = 0.0
+    else:
+        pct = (used / total) * 100.0
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round((pct / 100.0) * width))
+    filled = min(width, max(0, filled))
+    empty = width - filled
+
+    if pct >= 85.0:
+        bar_col = BRIGHT_RED
+    elif pct >= 70.0:
+        bar_col = ORANGE
+    elif pct >= 50.0:
+        bar_col = BRIGHT_YELLOW
+    else:
+        bar_col = BRIGHT_GREEN
+
+    return f"{bar_col}{'█' * filled}{BAR_EMPTY}{'░' * empty}{RESET} {BOLD}{WHITE}{pct:5.1f}%{RESET}"
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{int(minutes)}m {int(seconds % 60)}s"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{int(hours)}h {int(minutes % 60)}m"
+    days = hours / 24
+    return f"{int(days)}d {int(hours % 24)}h"
+
+def collect_processes(search=None, user=None, sort_by="rss", reverse=True):
+    attrs = ["pid", "name", "username", "memory_info", "memory_percent", "cpu_times", "cpu_percent", "num_threads", "status", "cmdline", "create_time"]
+    procs = []
+    now = time.time()
+    
+    for p in psutil.process_iter(attrs):
+        try:
+            info = p.info
+            mem_info = info.get("memory_info")
+            if not mem_info:
+                continue
+
+            rss = getattr(mem_info, "rss", 0)
+            vms = getattr(mem_info, "vms", 0)
+            shared = getattr(mem_info, "shared", 0)
+            mem_pct = info.get("memory_percent") or 0.0
+            
+            ctime = info.get("create_time") or now
+            uptime = max(0.1, now - ctime)
+            t = info.get("cpu_times")
+            if t and uptime > 0.1:
+                cpu_pct = ((t.user + t.system) / uptime) * 100.0
+            else:
+                cpu_pct = info.get("cpu_percent") or 0.0
+
+            pid = info.get("pid")
+            name = info.get("name") or "unknown"
+            uname = info.get("username") or "unknown"
+            threads = info.get("num_threads") or 1
+            status = info.get("status") or "unknown"
+            cmdline_list = info.get("cmdline") or []
+            cmdline = " ".join(cmdline_list) if cmdline_list else f"[{name}]"
+
+            # Filter by user
+            if user and uname.lower() != user.lower():
+                continue
+
+            # Filter by search pattern
+            if search:
+                pattern = str(search).lower()
+                matches = (
+                    pattern in name.lower() or
+                    pattern in cmdline.lower() or
+                    pattern in uname.lower() or
+                    pattern == str(pid)
+                )
+                if not matches:
+                    continue
+
+            procs.append({
+                "pid": pid,
+                "name": name,
+                "username": uname,
+                "rss": rss,
+                "vms": vms,
+                "shared": shared,
+                "percent": mem_pct,
+                "cpu_percent": cpu_pct,
+                "num_threads": threads,
+                "status": status,
+                "cmdline": cmdline,
+                "create_time": ctime
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    # Sort
+    sort_key = sort_by.lower()
+    if sort_key == "rss":
+        procs.sort(key=lambda x: x["rss"], reverse=reverse)
+    elif sort_key == "vms":
+        procs.sort(key=lambda x: x["vms"], reverse=reverse)
+    elif sort_key in ["cpu", "cpu_percent"]:
+        procs.sort(key=lambda x: x["cpu_percent"], reverse=reverse)
+    elif sort_key in ["percent", "mem"]:
+        procs.sort(key=lambda x: x["percent"], reverse=reverse)
+    elif sort_key in ["threads", "num_threads"]:
+        procs.sort(key=lambda x: x["num_threads"], reverse=reverse)
+    elif sort_key == "name":
+        procs.sort(key=lambda x: x["name"].lower(), reverse=not reverse)
+    elif sort_key == "pid":
+        procs.sort(key=lambda x: x["pid"], reverse=not reverse)
+    else:
+        procs.sort(key=lambda x: x["rss"], reverse=True)
+
+    return procs
+
+def group_processes(proc_list):
+    groups = {}
+    for p in proc_list:
+        key = p["name"]
+        if key not in groups:
+            groups[key] = {
+                "name": key,
+                "count": 0,
+                "rss": 0,
+                "vms": 0,
+                "shared": 0,
+                "percent": 0.0,
+                "cpu_percent": 0.0,
+                "threads": 0,
+                "max_rss_pid": p["pid"],
+                "max_rss_val": p["rss"],
+                "pids": [],
+                "sample_cmd": p["cmdline"]
+            }
+        g = groups[key]
+        g["count"] += 1
+        g["rss"] += p["rss"]
+        g["vms"] += p["vms"]
+        g["shared"] += p["shared"]
+        g["percent"] += p["percent"]
+        g["cpu_percent"] += p["cpu_percent"]
+        g["threads"] += p["num_threads"]
+        g["pids"].append(p["pid"])
+        if p["rss"] > g["max_rss_val"]:
+            g["max_rss_val"] = p["rss"]
+            g["max_rss_pid"] = p["pid"]
+            g["sample_cmd"] = p["cmdline"]
+
+    res = list(groups.values())
+    res.sort(key=lambda x: x["rss"], reverse=True)
+    return res
+
+def print_system_header(vmem, swap, total_tasks, running_tasks):
+    term_width = shutil.get_terminal_size((100, 24)).columns
+    box_width = min(term_width - 2, 104)
+
+    ram_bar = render_gauge(vmem.used, vmem.total, width=18)
+    swap_bar = render_gauge(swap.used, swap.total, width=18)
+
+    used_ram = format_bytes(vmem.used)
+    free_ram = format_bytes(vmem.available)
+    tot_ram = format_bytes(vmem.total)
+
+    used_swap = format_bytes(swap.used)
+    tot_swap = format_bytes(swap.total)
+
+    line1 = f" {BOLD}{ELECTRIC_CYAN}󰍛 Memory Overview{RESET}   {SKY_BLUE}│{RESET}  RAM: {ram_bar}  {WHITE}({BOLD}{BRIGHT_YELLOW}{used_ram}{RESET} {MUTED}/{RESET} {WHITE}{tot_ram}{RESET}{MUTED}, Avail:{RESET} {BOLD}{BRIGHT_GREEN}{free_ram}{RESET}{WHITE}){RESET}"
+    line2 = f" {BOLD}{PURPLE}󰾴 Swap Space{RESET}        {SKY_BLUE}│{RESET}  SWAP: {swap_bar}  {WHITE}({BOLD}{SKY_BLUE}{used_swap}{RESET} {MUTED}/{RESET} {WHITE}{tot_swap}{RESET}{WHITE}){RESET}"
+    line3 = f" {BOLD}{BRIGHT_YELLOW}󰄛 System Analytics{RESET}  {SKY_BLUE}│{RESET}  Total: {BOLD}{WHITE}{total_tasks}{RESET} {MUTED}tasks{RESET}  {SKY_BLUE}│{RESET}  Running: {BOLD}{BRIGHT_GREEN}{running_tasks}{RESET}  {SKY_BLUE}│{RESET}  Sorted by: {BOLD}{ELECTRIC_CYAN}RAM (RSS){RESET}"
+
+    border_top = f"{SKY_BLUE}╭{'─' * (box_width)}╮{RESET}"
+    border_bot = f"{SKY_BLUE}╰{'─' * (box_width)}╯{RESET}"
+
+    print(border_top)
+    print(f"{SKY_BLUE}│{RESET}{line1}")
+    print(f"{SKY_BLUE}│{RESET}{line2}")
+    print(f"{SKY_BLUE}│{RESET}{line3}")
+    print(border_bot)
+
+def render_table(procs, vmem, limit=30):
+    term_width = shutil.get_terminal_size((120, 24)).columns
+
+    # Dynamic command width calculation
+    fixed_len = 2 + 5 + 7 + 12 + 7 + 11 + 17 + 5 + 8 + 18  # Sum of standard column widths + gaps
+    cmd_width = max(20, term_width - fixed_len - 6)
+
+    # Header
+    hdr = (
+        f"{BOLD}{ELECTRIC_CYAN}  {'#':<3} "
+        f"{'PID':<7} "
+        f"{'USER':<12} "
+        f"{'CPU%':>6}  "
+        f"{'RAM (RSS)':>10}  "
+        f"{'%MEM (BAR)':<15} "
+        f"{'TH':>4} "
+        f"{'STATE':<7} "
+        f"{'PROCESS':<18} "
+        f"{'COMMAND'}{RESET}"
+    )
+    print(hdr)
+    print(f"{SKY_BLUE}  {'─'*3} {'─'*7} {'─'*12} {'─'*6}  {'─'*10}  {'─'*15} {'─'*4} {'─'*7} {'─'*18} {'─'*cmd_width}{RESET}")
+
+    shown = procs if (limit is None or limit <= 0) else procs[:limit]
+    sum_rss = 0
+    now = time.time()
+
+    for idx, p in enumerate(shown, 1):
+        sum_rss += p["rss"]
+        rank_str = f"{GRAY}{idx:<3}{RESET}"
+        pid_str = f"{ELECTRIC_CYAN}{p['pid']:<7}{RESET}"
+        
+        user_str = color_user(p['username'], width=12)
+
+        cpu_str = color_cpu(p["cpu_percent"])
+        ram_str = color_ram(p["rss"], p["percent"], width=10)
+        mem_bar = render_mini_bar(p["percent"], width=7)
+
+        th_str = f"{GRAY}{p['num_threads']:>4}{RESET}"
+
+        st = p["status"]
+        if st == "running":
+            st_str = f"{BRIGHT_GREEN}{'R':<7}{RESET}"
+        elif st == "sleeping":
+            st_str = f"{GRAY}{'S':<7}{RESET}"
+        elif st in ["stopped", "zombie"]:
+            st_str = f"{BRIGHT_RED}{st[:7]:<7}{RESET}"
+        else:
+            st_str = f"{YELLOW}{st[:7]:<7}{RESET}"
+
+        name_raw = p["name"]
+        if len(name_raw) > 17:
+            name_raw = name_raw[:16] + "…"
+        name_str = f"{BOLD}{WHITE}{name_raw:<18}{RESET}"
+
+        cmd_raw = p["cmdline"].strip()
+        if len(cmd_raw) > cmd_width:
+            cmd_raw = cmd_raw[:cmd_width - 1] + "…"
+        cmd_str = f"{DIM}{cmd_raw}{RESET}"
+
+        print(f"  {rank_str} {pid_str} {user_str} {cpu_str}  {ram_str}  {mem_bar} {th_str} {st_str} {name_str} {cmd_str}")
+
+    # Summary Footer
+    shown_pct = (sum_rss / vmem.total) * 100.0 if vmem.total else 0.0
+    print(f"\n  {SKY_BLUE}Showing top {BOLD}{WHITE}{len(shown)}{RESET}{SKY_BLUE} of {BOLD}{WHITE}{len(procs)}{RESET}{SKY_BLUE} processes │ Accounted RAM: {BOLD}{color_ram(sum_rss, shown_pct)}{RESET} {WHITE}({BOLD}{BRIGHT_YELLOW}{shown_pct:.1f}%{RESET}{WHITE} of total RAM){RESET}\n")
+
+def render_group_table(groups, vmem, limit=25):
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    fixed_len = 2 + 5 + 22 + 8 + 12 + 17 + 10 + 9  # Standard columns
+    cmd_width = max(20, term_width - fixed_len - 6)
+
+    hdr = (
+        f"{BOLD}{ELECTRIC_CYAN}  {'#':<3} "
+        f"{'APPLICATION':<22} "
+        f"{'PROCS':>6}  "
+        f"{'TOTAL RAM':>11}  "
+        f"{'%MEM (BAR)':<15} "
+        f"{'AVG RAM':>10}  "
+        f"{'TOP PID':>8}  "
+        f"{'SAMPLE COMMAND'}{RESET}"
+    )
+    print(hdr)
+    print(f"{SKY_BLUE}  {'─'*3} {'─'*22} {'─'*6}  {'─'*11}  {'─'*15} {'─'*10}  {'─'*8}  {'─'*cmd_width}{RESET}")
+
+    shown = groups if (limit is None or limit <= 0) else groups[:limit]
+    sum_rss = 0
+
+    for idx, g in enumerate(shown, 1):
+        sum_rss += g["rss"]
+        rank_str = f"{GRAY}{idx:<3}{RESET}"
+        
+        name_raw = g["name"]
+        if len(name_raw) > 21:
+            name_raw = name_raw[:20] + "…"
+        name_str = f"{BOLD}{ELECTRIC_CYAN}{name_raw:<22}{RESET}"
+
+        count_str = f"{BOLD}{WHITE}{g['count']:>6}{RESET}"
+        tot_ram_str = color_ram(g["rss"], g["percent"], width=11)
+        mem_bar = render_mini_bar(g["percent"], width=7)
+
+        avg_rss = g["rss"] / max(1, g["count"])
+        avg_str = f"{GRAY}{format_bytes(avg_rss):>10}{RESET}"
+
+        top_pid_str = f"{YELLOW}{g['max_rss_pid']:>8}{RESET}"
+
+        cmd_raw = g["sample_cmd"].strip()
+        if len(cmd_raw) > cmd_width:
+            cmd_raw = cmd_raw[:cmd_width - 1] + "…"
+        cmd_str = f"{DIM}{cmd_raw}{RESET}"
+
+        print(f"  {rank_str} {name_str} {count_str}  {tot_ram_str}  {mem_bar} {avg_str}  {top_pid_str}  {cmd_str}")
+
+    shown_pct = (sum_rss / vmem.total) * 100.0 if vmem.total else 0.0
+    print(f"\n  {SKY_BLUE}Showing top {BOLD}{WHITE}{len(shown)}{RESET}{SKY_BLUE} application groups │ Combined RAM: {BOLD}{color_ram(sum_rss, shown_pct)}{RESET} {WHITE}({BOLD}{BRIGHT_YELLOW}{shown_pct:.1f}%{RESET}{WHITE} of total RAM){RESET}\n")
+
+def inspect_process(pid):
+    try:
+        p = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        print(f"{RED}Error: Process with PID {pid} does not exist.{RESET}")
+        return
+    except psutil.AccessDenied:
+        print(f"{RED}Error: Access denied to process {pid}. Try with sudo.{RESET}")
+        return
+
+    try:
+        name = p.name()
+        uids = p.uids()
+        uname = p.username()
+        status = p.status()
+        ctime = p.create_time()
+        uptime = format_duration(time.time() - ctime)
+        started_str = datetime.datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M:%S")
+
+        mem = p.memory_info()
+        mem_pct = p.memory_percent()
+        cpu_pct = p.cpu_percent(interval=None)
+        cpu_times = p.cpu_times()
+        threads = p.num_threads()
+
+        try:
+            cmdline = " ".join(p.cmdline())
+        except (psutil.AccessDenied, psutil.ZombieProcess):
+            cmdline = f"[{name}]"
+
+        try:
+            exe = p.exe()
+        except (psutil.AccessDenied, psutil.ZombieProcess):
+            exe = "N/A (restricted)"
+
+        try:
+            cwd = p.cwd()
+        except (psutil.AccessDenied, psutil.ZombieProcess):
+            cwd = "N/A (restricted)"
+
+        try:
+            parent = p.parent()
+            parent_str = f"{parent.name()} (PID {parent.pid})" if parent else "None (root/init)"
+        except Exception:
+            parent_str = "Unknown"
+
+        try:
+            num_fds = p.num_fds() if hasattr(p, "num_fds") else len(p.open_files())
+        except Exception:
+            num_fds = "N/A"
+
+        vmem = psutil.virtual_memory()
+        mem_bar = render_mini_bar(mem_pct, width=16)
+
+        print(f"\n{BOLD}{ELECTRIC_CYAN}╭─────────────────────────────────────────────────────────────╮{RESET}")
+        print(f"{BOLD}{ELECTRIC_CYAN}│  󰄛 Process Deep Inspection: {name:<30} │{RESET}")
+        print(f"{BOLD}{ELECTRIC_CYAN}╰─────────────────────────────────────────────────────────────╯{RESET}")
+        print(f"  {GRAY}PID:{RESET}            {BOLD}{WHITE}{p.pid}{RESET}  {GRAY}(Parent: {parent_str}){RESET}")
+        print(f"  {GRAY}User:{RESET}           {color_user(uname, width=0)} {GRAY}(UID: {uids.real}){RESET}")
+        print(f"  {GRAY}Status:{RESET}         {BRIGHT_GREEN if status == 'running' else YELLOW}{status.upper()}{RESET}")
+        print(f"  {GRAY}Started:{RESET}        {WHITE}{started_str}{RESET} {GRAY}(Active for: {uptime}){RESET}")
+        print(f"  {GRAY}Binary Path:{RESET}    {SKY_BLUE}{exe}{RESET}")
+        print(f"  {GRAY}Working Dir:{RESET}    {SKY_BLUE}{cwd}{RESET}")
+        print(f"\n  {BOLD}{WHITE}Memory Breakdown:{RESET}")
+        print(f"    • {GRAY}Physical RAM (RSS):{RESET}    {color_ram(mem.rss, mem_pct)}")
+        print(f"    • {GRAY}System RAM Share:{RESET}      {mem_bar}")
+        print(f"    • {GRAY}Virtual Memory (VMS):{RESET}  {format_bytes(mem.vms)}")
+        print(f"    • {GRAY}Shared Memory:{RESET}         {format_bytes(getattr(mem, 'shared', 0))}")
+        print(f"    • {GRAY}Data / Dirty Pages:{RESET}    {format_bytes(getattr(mem, 'data', 0))} / {format_bytes(getattr(mem, 'dirty', 0))}")
+        print(f"\n  {BOLD}{WHITE}Performance & Resources:{RESET}")
+        print(f"    • {GRAY}CPU Usage:{RESET}             {color_cpu(cpu_pct)}")
+        print(f"    • {GRAY}CPU Time (User/Sys):{RESET}   {cpu_times.user:.2f}s user, {cpu_times.system:.2f}s system")
+        print(f"    • {GRAY}Active Threads:{RESET}        {WHITE}{threads}{RESET}")
+        print(f"    • {GRAY}Open File Handles:{RESET}     {WHITE}{num_fds}{RESET}")
+        print(f"\n  {BOLD}{WHITE}Full Command Line:{RESET}")
+        print(f"    {DIM}{cmdline}{RESET}\n")
+
+    except Exception as e:
+        print(f"{RED}Error inspecting process {pid}: {e}{RESET}")
+
+ANSI_STRIP_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+def format_fzf_proc_line(p):
+    pid_str = f"{ELECTRIC_CYAN}{p['pid']:<7}{RESET}"
+    user_str = color_user(p['username'], width=12)
+    cpu_str = color_cpu(p["cpu_percent"])
+    ram_str = color_ram(p["rss"], p["percent"], width=10)
+    mem_bar = render_mini_bar(p["percent"], width=7)
+    th_str = f"{GRAY}{p['num_threads']:>4}{RESET}"
+    
+    st = p["status"]
+    if st == "running":
+        st_str = f"{BRIGHT_GREEN}{'R':<3}{RESET}"
+    elif st == "sleeping":
+        st_str = f"{GRAY}{'S':<3}{RESET}"
+    elif st in ["stopped", "zombie"]:
+        st_str = f"{BRIGHT_RED}{st[:3]:<3}{RESET}"
+    else:
+        st_str = f"{YELLOW}{st[:3]:<3}{RESET}"
+
+    name_raw = p["name"]
+    if len(name_raw) > 17:
+        name_raw = name_raw[:16] + "…"
+    name_str = f"{BOLD}{WHITE}{name_raw:<18}{RESET}"
+    cmd_str = f"{DIM}{p['cmdline']}{RESET}"
+    return f"{pid_str} {user_str} {cpu_str}  {ram_str}  {mem_bar} {th_str} {st_str} {name_str} {cmd_str}"
+
+def run_fzf_mode(procs, vmem):
+    if not shutil.which("fzf"):
+        print(f"{RED}Error: 'fzf' is not installed. Run 'sudo pacman -S fzf' or use standard output.{RESET}")
+        return
+
+    script_path = os.path.realpath(__file__)
+    fzf_header = f"{BOLD}{ELECTRIC_CYAN}  {'PID':<7} {'USER':<12} {'CPU%':>6}  {'RAM (RSS)':>10}  {'%MEM (BAR)':<15} {'TH':>4} {'ST':<3} {'PROCESS':<18} COMMAND{RESET}"
+    lines = [fzf_header]
+
+    for p in procs:
+        lines.append(f"  {format_fzf_proc_line(p)}")
+
+    preview_cmd = f"{script_path} --inspect {{1}}"
+
+    fzf_cmd = [
+        "fzf",
+        "--ansi",
+        "--header-lines=1",
+        "--layout=reverse",
+        "--border=rounded",
+        "--prompt=󰍛 RAM Explorer > ",
+        "--header=[Enter] Inspect  │  [Ctrl-K] Kill (SIGTERM)  │  [Ctrl-9] Force Kill  │  [Ctrl-R] Refresh  │  [Esc] Exit",
+        f"--preview={preview_cmd}",
+        "--preview-window=right:55%:wrap:border-rounded",
+        "--bind=shift-up:preview-up",
+        "--bind=shift-down:preview-down",
+        "--bind=page-up:preview-page-up",
+        "--bind=page-down:preview-page-down",
+        f"--bind=ctrl-k:execute(kill -15 {{1}} 2>/dev/null && notify-send 'Process Manager' 'Sent SIGTERM to PID {{1}}')+reload({script_path} --fzf-dump)",
+        f"--bind=ctrl-9:execute(kill -9 {{1}} 2>/dev/null && notify-send 'Process Manager' 'Sent SIGKILL to PID {{1}}')+reload({script_path} --fzf-dump)",
+        f"--bind=ctrl-r:reload({script_path} --fzf-dump)",
+        "--bind=ctrl-y:execute(echo -n {1} | wl-copy 2>/dev/null || echo -n {1} | xclip -sel clip 2>/dev/null)",
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        selected_line, _ = proc.communicate(input="\n".join(lines))
+        if proc.returncode == 0 and selected_line.strip():
+            clean_line = ANSI_STRIP_REGEX.sub('', selected_line).strip()
+            tokens = clean_line.split()
+            if tokens:
+                inspect_process(int(tokens[0]))
+    except KeyboardInterrupt:
+        pass
+
+def fzf_dump_lines():
+    procs = collect_processes(sort_by="rss")
+    fzf_header = f"{BOLD}{ELECTRIC_CYAN}  {'PID':<7} {'USER':<12} {'CPU%':>6}  {'RAM (RSS)':>10}  {'%MEM (BAR)':<15} {'TH':>4} {'ST':<3} {'PROCESS':<18} COMMAND{RESET}"
+    print(fzf_header)
+    for p in procs:
+        print(f"  {format_fzf_proc_line(p)}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="pmem: Universal Smart, Fast & Beautiful Process Memory Explorer & RAM Profiler",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("-n", "--limit", "--top", default=30, help="Number of processes to display (default: 30; 0 or 'all' for unlimited)")
+    parser.add_argument("-g", "--group", action="store_true", help="Group by application name and sum memory usage")
+    parser.add_argument("-s", "--search", help="Filter processes by name, PID, user, or command line regex/keyword")
+    parser.add_argument("-u", "--user", help="Filter processes by username")
+    parser.add_argument("-w", "--watch", nargs="?", const=2.0, type=float, help="Live watch mode with refresh interval in seconds (default: 2.0)")
+    parser.add_argument("-i", "--fzf", "--interactive", action="store_true", help="Launch interactive FZF browser with live preview and process controls")
+    parser.add_argument("-f", dest="fzf_alias", action="store_true", help="Alias for -i / --fzf")
+    parser.add_argument("-c", "--color", choices=["auto", "always", "never"], default="auto", help="Color output mode (auto, always, never; default: auto)")
+    parser.add_argument("--sort", choices=["rss", "vms", "cpu", "percent", "threads", "name", "pid"], default="rss", help="Sorting field (default: rss)")
+    parser.add_argument("--asc", action="store_true", help="Sort in ascending order (default: descending)")
+    parser.add_argument("--inspect", type=int, help="Display comprehensive resource breakdown for a specific PID")
+    parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color codes")
+    parser.add_argument("--fzf-dump", action="store_true", help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    # Color mode handling
+    if args.color == "never" or args.no_color:
+        disable_colors()
+    elif args.color == "always":
+        pass  # Preserve colors even through pipes
+    elif not sys.stdout.isatty() and not (args.json or args.inspect or args.fzf_dump):
+        disable_colors()
+
+    # Consolidate fzf flag
+    if getattr(args, "fzf_alias", False):
+        args.fzf = True
+
+    # Internal helper for FZF reloading
+    if args.fzf_dump:
+        fzf_dump_lines()
+        return
+
+    # Single PID inspect mode
+    if args.inspect is not None:
+        inspect_process(args.inspect)
+        return
+
+    # Parse limit
+    limit = 30
+    if args.limit:
+        if str(args.limit).lower() in ["0", "all", "none", "unlimited"]:
+            limit = None
+        else:
+            try:
+                limit = int(args.limit)
+            except ValueError:
+                limit = 30
+
+    reverse_sort = not args.asc
+
+    # Interactive FZF Mode
+    if args.fzf:
+        vmem = psutil.virtual_memory()
+        procs = collect_processes(search=args.search, user=args.user, sort_by=args.sort, reverse=reverse_sort)
+        run_fzf_mode(procs, vmem)
+        return
+
+    # Live Watch Mode
+    if args.watch is not None:
+        interval = max(0.5, args.watch)
+        try:
+            while True:
+                vmem = psutil.virtual_memory()
+                swap = psutil.swap_memory()
+                procs = collect_processes(search=args.search, user=args.user, sort_by=args.sort, reverse=reverse_sort)
+                running_tasks = sum(1 for p in procs if p["status"] == "running")
+
+                print(f"{ESC}[2J{ESC}[H", end="", flush=True)
+                print_system_header(vmem, swap, len(procs), running_tasks)
+                
+                if args.group:
+                    groups = group_processes(procs)
+                    render_group_table(groups, vmem, limit=limit)
+                else:
+                    render_table(procs, vmem, limit=limit)
+
+                print(f"{GRAY}  Refreshing every {interval:.1f}s │ Press Ctrl+C to exit{RESET}", flush=True)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print(f"\n{GRAY}Exited live watch mode.{RESET}")
+            return
+
+    # Standard Execution
+    vmem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    procs = collect_processes(search=args.search, user=args.user, sort_by=args.sort, reverse=reverse_sort)
+
+    if args.json:
+        if args.group:
+            data = group_processes(procs)
+        else:
+            data = procs
+        output_payload = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "system_memory": {
+                "total_bytes": vmem.total,
+                "used_bytes": vmem.used,
+                "available_bytes": vmem.available,
+                "percent": vmem.percent
+            },
+            "system_swap": {
+                "total_bytes": swap.total,
+                "used_bytes": swap.used,
+                "percent": swap.percent
+            },
+            "processes_count": len(procs),
+            "results": data if (limit is None) else data[:limit]
+        }
+        print(json.dumps(output_payload, indent=2))
+        return
+
+    running_tasks = sum(1 for p in procs if p["status"] == "running")
+    print_system_header(vmem, swap, len(procs), running_tasks)
+
+    if args.group:
+        groups = group_processes(procs)
+        render_group_table(groups, vmem, limit=limit)
+    else:
+        render_table(procs, vmem, limit=limit)
+
+if __name__ == "__main__":
+    main()

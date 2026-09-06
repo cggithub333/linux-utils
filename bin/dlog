@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""
+dlog: Universal Smart & Beautiful Docker Log Streamer & Interactive FZF Explorer
+"""
+import sys
+import os
+import re
+import json
+import datetime
+import subprocess
+import signal
+import argparse
+
+# Handle SIGPIPE cleanly for fzf preview and unix pipelines
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+# --- ANSI Color Codes ---
+ESC = chr(27)
+RESET = f"{ESC}[0m"
+BOLD = f"{ESC}[1m"
+DIM = f"{ESC}[2m"
+UNDERLINE = f"{ESC}[4m"
+
+# Palette
+GREEN = f"{ESC}[32m"
+BRIGHT_GREEN = f"{ESC}[92m"
+YELLOW = f"{ESC}[33m"
+BRIGHT_YELLOW = f"{ESC}[93m"
+RED = f"{ESC}[31m"
+MAGENTA = f"{ESC}[35m"
+BLUE = f"{ESC}[34m"
+WHITE = f"{ESC}[97m"
+GRAY = f"{ESC}[90m"
+CYAN = f"{ESC}[36m"
+ELECTRIC_CYAN = f"{ESC}[38;5;45m"
+SKY_BLUE = f"{ESC}[38;5;81m"
+PATH_COLOR = f"{ESC}[1;97m"
+
+PINO_LEVELS = {
+    10: "TRACE",
+    20: "DEBUG",
+    30: "INFO",
+    40: "WARN",
+    50: "ERROR",
+    60: "FATAL"
+}
+
+LEVEL_SEVERITY = {
+    "TRACE": 0,
+    "DEBUG": 1,
+    "LOG": 2,
+    "INFO": 2,
+    "NOTICE": 2,
+    "WARN": 3,
+    "WARNING": 3,
+    "ERROR": 4,
+    "ERR": 4,
+    "CRITICAL": 5,
+    "CRIT": 5,
+    "FATAL": 5,
+    "PANIC": 5
+}
+
+ANSI_STRIP_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+URL_REGEX = re.compile(r'((?:https?|amqps?|wss?|mongodb(?:\+srv)?|redis|grpc|postgres(?:ql)?)://[^\s\"\'\(\)>]+)')
+HOST_PORT_REGEX = re.compile(r'\b([a-zA-Z0-9\.\-]+\.(?:net|com|org|io|dev|internal|svc|gov|edu|co|ai|app|mongodb\.net)(?::\d+)?)\b')
+IP_PORT_REGEX = re.compile(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?)\b')
+QUOTED_REGEX = re.compile(r"('[\w\.\-\/@\:\+\=]+'|\"[\w\.\-\/@\:\+\=]+\")")
+CLASS_STRUCT_REGEX = re.compile(r'\b([A-Z][a-zA-Z0-9_]+)(\{|\()')
+STATE_REGEX = re.compile(r'\b(REPLICA_SET_PRIMARY|REPLICA_SET_SECONDARY|CONNECTED|DISCONNECTED|READY|PRIMARY|SECONDARY|ELECTABLE|OPERATIONAL|SUCCESS|FAILED|RUNNING|INITIALIZED)\b')
+BOOLEAN_NULL_REGEX = re.compile(r'\b(true|false|null)\b')
+KV_KEY_REGEX = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_\.\-]*)=')
+NUMBER_UNIT_REGEX = re.compile(r'\b(\d+(?:\.\d+)?\s*(?:ms|ns|sec|seconds|min|minutes|MB|KB|GB|B|bytes|req/s))\b')
+
+def colorize_rich_text(text):
+    if not text:
+        return ""
+    
+    # OSC 8 Terminal-Clickable URLs for HTTP/HTTPS/WS
+    def make_clickable_url(m):
+        url = m.group(1)
+        if url.startswith("http://") or url.startswith("https://") or url.startswith("ws://") or url.startswith("wss://"):
+            return f"{ESC}]8;;{url}{ESC}\\{UNDERLINE}{ELECTRIC_CYAN}{url}{RESET}{ESC}]8;;{ESC}\\"
+        else:
+            return f"{UNDERLINE}{ELECTRIC_CYAN}{url}{RESET}"
+
+    text = URL_REGEX.sub(make_clickable_url, text)
+    text = HOST_PORT_REGEX.sub(lambda m: f"{SKY_BLUE}{m.group(1)}{RESET}", text)
+    text = IP_PORT_REGEX.sub(lambda m: f"{SKY_BLUE}{m.group(1)}{RESET}", text)
+    text = CLASS_STRUCT_REGEX.sub(lambda m: f"{BOLD}{BRIGHT_YELLOW}{m.group(1)}{RESET}{GRAY}{m.group(2)}{RESET}", text)
+    
+    def color_state(m):
+        st = m.group(1)
+        if st in ["REPLICA_SET_PRIMARY", "PRIMARY", "CONNECTED", "READY", "ELECTABLE", "OPERATIONAL", "SUCCESS", "INITIALIZED"]:
+            return f"{BOLD}{BRIGHT_GREEN}{st}{RESET}"
+        elif st in ["REPLICA_SET_SECONDARY", "SECONDARY", "RUNNING"]:
+            return f"{CYAN}{st}{RESET}"
+        else:
+            return f"{BOLD}{RED}{st}{RESET}"
+    text = STATE_REGEX.sub(color_state, text)
+    
+    def color_bool(m):
+        b = m.group(1)
+        if b == "true":
+            return f"{GREEN}{b}{RESET}"
+        elif b == "false":
+            return f"{RED}{b}{RESET}"
+        else:
+            return f"{GRAY}{b}{RESET}"
+    text = BOOLEAN_NULL_REGEX.sub(color_bool, text)
+    text = NUMBER_UNIT_REGEX.sub(lambda m: f"{YELLOW}{m.group(1)}{RESET}", text)
+    text = QUOTED_REGEX.sub(lambda m: f"{BRIGHT_GREEN}{m.group(1)}{RESET}", text)
+    text = KV_KEY_REGEX.sub(lambda m: f"{CYAN}{m.group(1)}{RESET}=", text)
+    return text
+
+def color_level(lvl):
+    u = str(lvl).upper()
+    if u in ["LOG", "INFO", "NOTICE"]:
+        col = GREEN
+    elif u in ["WARN", "WARNING"]:
+        col = YELLOW
+    elif any(k in u for k in ["ERR", "CRIT", "FATAL", "PANIC"]):
+        col = f"{BOLD}{RED}"
+    elif u == "DEBUG":
+        col = BLUE
+    elif u == "TRACE":
+        col = GRAY
+    else:
+        col = CYAN
+    return f"{col}[{u:^5}]{RESET}"
+
+def color_status(sc):
+    try:
+        n = int(sc)
+        col = GREEN if n < 300 else CYAN if n < 400 else YELLOW if n < 500 else f"{BOLD}{RED}"
+        return f"{col}{BOLD}{n}{RESET}"
+    except Exception:
+        return str(sc)
+
+def parse_key_value_pairs(text):
+    pairs = {}
+    pattern = re.compile(r'(\b[\w\.\-]+)=(".*?"|\S+)')
+    for match in pattern.finditer(text):
+        k, v = match.group(1), match.group(2)
+        if v.startswith('"') and v.endswith('"'):
+            v = v[1:-1]
+        pairs[k] = v
+    return pairs
+
+def format_line(raw, min_level=None, search_pattern=None, raw_json_mode=False):
+    line = ANSI_STRIP_REGEX.sub('', raw).strip()
+    if not line:
+        return None
+
+    if search_pattern and not re.search(search_pattern, line, re.IGNORECASE):
+        return None
+
+    detected_level = "INFO"
+    formatted = None
+
+    # CASE 1: JSON
+    if line.startswith("{") and line.endswith("}"):
+        try:
+            d = json.loads(line)
+            if raw_json_mode:
+                return json.dumps(d, indent=2)
+
+            t_raw = d.get("time") or d.get("timestamp") or d.get("ts") or ""
+            t_str = ""
+            if isinstance(t_raw, (int, float)):
+                if t_raw > 1e11:
+                    dt = datetime.datetime.fromtimestamp(t_raw / 1000.0)
+                else:
+                    dt = datetime.datetime.fromtimestamp(t_raw)
+                t_str = f"{GRAY}{dt.strftime('%H:%M:%S')}{RESET}"
+            elif isinstance(t_raw, str) and "T" in t_raw:
+                t_str = f"{GRAY}{t_raw.split('T')[1].split('.')[0]}{RESET}"
+            elif isinstance(t_raw, str) and t_raw:
+                t_str = f"{GRAY}{t_raw}{RESET}"
+
+            lvl_val = d.get("level") or d.get("severity") or "INFO"
+            if isinstance(lvl_val, int) and lvl_val in PINO_LEVELS:
+                detected_level = PINO_LEVELS[lvl_val]
+            else:
+                detected_level = str(lvl_val).upper()
+            lvl_str = color_level(detected_level)
+
+            svc = d.get("service") or d.get("logger") or d.get("caller") or ""
+            if "." in svc and "/" not in svc:
+                svc = svc.split(".")[-1]
+            svc_str = f"{CYAN}[{svc}]{RESET}" if svc else ""
+
+            req = d.get("req") or {}
+            method = d.get("method") or req.get("method") or ""
+            path = d.get("path") or d.get("url") or req.get("url") or ""
+            path_hl = colorize_rich_text(path) if "://" in path else f"{PATH_COLOR}{path}{RESET}" if path else ""
+            http_str = f"{MAGENTA}{BOLD}{method}{RESET} {path_hl}" if (method or path) else ""
+
+            res = d.get("res") or {}
+            sc = d.get("status") or d.get("statusCode") or res.get("statusCode")
+            sc_str = f"-> {color_status(sc)}" if sc is not None else ""
+
+            dur = d.get("durationMs") or d.get("duration") or d.get("responseTime")
+            dur_str = f"{YELLOW}{dur}ms{RESET}" if dur is not None else ""
+            b = d.get("bytes") or d.get("contentLength")
+            b_str = f"{GRAY}{b}B{RESET}" if b is not None else ""
+            metrics = f"{GRAY}({dur_str}{GRAY}, {b_str}{GRAY}){RESET}" if (dur_str and b_str) else f"{GRAY}({dur_str or b_str}{GRAY}){RESET}" if (dur_str or b_str) else ""
+
+            msg = d.get("msg") or d.get("message") or d.get("err") or d.get("error") or ""
+            if isinstance(msg, dict):
+                msg = msg.get("message") or str(msg)
+            if http_str and msg in ["request completed", "http request"]:
+                msg_str = ""
+            else:
+                msg_str = colorize_rich_text(msg) if msg else ""
+
+            parts = [p for p in [t_str, lvl_str, svc_str, http_str, sc_str, metrics, msg_str] if p]
+            formatted = "  ".join(parts)
+        except Exception:
+            pass
+
+    # CASE 2: NestJS
+    if not formatted:
+        nest_match = re.match(r"^\[Nest\]\s+\d+\s+-\s+(\d{2}/\d{2}/\d{4},\s+\d{1,2}:\d{2}:\d{2}\s+(?:AM|PM))\s+([A-Z]+)\s+\[(.*?)\]\s*(.*)$", line)
+        if nest_match:
+            t_raw, lvl, ctx, msg = nest_match.groups()
+            detected_level = lvl.upper()
+            t_time = t_raw.split(",")[1].strip() if "," in t_raw else t_raw
+            msg_hl = colorize_rich_text(msg)
+            formatted = f"{GRAY}{t_time}{RESET}  {color_level(lvl)}  {CYAN}[Nest:{ctx}]{RESET}  {msg_hl}"
+
+    # CASE 3: Spring Boot Plain Text
+    if not formatted:
+        sb_match = re.match(r"^(\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?))\s+(\w+)\s+\d+\s+---\s+\[(.*?)\]\s+\[(.*?)\]\s+([\w\.]+)\s*:\s*(.*)$", line)
+        if sb_match:
+            _, t, lvl, service, thread, clazz, msg = sb_match.groups()
+            detected_level = lvl.upper()
+            if "." in t:
+                t = t.split(".")[0]
+            c_short = clazz.split(".")[-1]
+            msg_hl = colorize_rich_text(msg)
+            formatted = f"{GRAY}{t}{RESET}  {color_level(lvl)}  {CYAN}[{service.strip()}]{RESET} {GRAY}{c_short}:{RESET} {msg_hl}"
+
+    # CASE 4: Python FastAPI / Uvicorn
+    if not formatted:
+        uv_match = re.match(r"^(INFO|WARNING|WARN|ERROR|DEBUG|CRITICAL):\s+(\S+)\s+-\s+\"([A-Z]+)\s+(\S+)\s+HTTP/[^\"]+\"\s+(\d{3})\s*(.*)$", line)
+        if uv_match:
+            lvl, ip, method, path, sc, status_msg = uv_match.groups()
+            detected_level = lvl.upper()
+            path_hl = f"{PATH_COLOR}{path}{RESET}"
+            formatted = f"{color_level(lvl)}  {MAGENTA}{BOLD}{method}{RESET} {path_hl} -> {color_status(sc)} {status_msg}  {GRAY}({ip}){RESET}"
+
+    # CASE 5: Nginx / APISIX Combined Access Log
+    if not formatted:
+        ng_match = re.match(r"^(\S+)\s+\S+\s+\S+\s+\[(\d{2}/\w+/\d{4}:(\d{2}:\d{2}:\d{2})\s+[^\]]+)\]\s+(?:(\S+)\s+)?\"([A-Z]+)\s+(\S+)\s+HTTP/[^\"]+\"\s+(\d{3})\s+(\d+)\s+([\d\.]+)", line)
+        if ng_match:
+            ip, _, t, host, method, path, sc, bytes_val, lat = ng_match.groups()
+            lat_ms = float(lat) * 1000
+            detected_level = "INFO"
+            path_hl = f"{PATH_COLOR}{path}{RESET}"
+            formatted = f"{GRAY}{t}{RESET}  {color_level('INFO')}  {MAGENTA}{BOLD}{method}{RESET} {path_hl} -> {color_status(sc)}  {YELLOW}{lat_ms:.1f}ms{RESET} {GRAY}({bytes_val}B, {ip}){RESET}"
+
+    # CASE 6: Logfmt (Prometheus, Promtail, Loki, Grafana)
+    if not formatted and ("level=" in line or "msg=" in line or "caller=" in line or "logger=" in line) and ("=" in line):
+        kv = parse_key_value_pairs(line)
+        if kv.get("level") or kv.get("msg") or kv.get("logger"):
+            lvl = kv.get("level") or "INFO"
+            detected_level = lvl.upper()
+            t_raw = kv.get("ts") or kv.get("t") or kv.get("time") or ""
+            t_str = ""
+            if "T" in t_raw:
+                t_str = f"{GRAY}{t_raw.split('T')[1].split('.')[0]}{RESET}"
+            caller = kv.get("logger") or kv.get("caller") or kv.get("component") or ""
+            caller_str = f"{CYAN}[{caller}]{RESET}" if caller else ""
+            msg = kv.get("msg") or ""
+            msg_hl = colorize_rich_text(msg) if msg else ""
+
+            extras = []
+            for k, v in kv.items():
+                if k not in ["level", "ts", "t", "time", "logger", "caller", "component", "msg"]:
+                    v_hl = colorize_rich_text(v)
+                    extras.append(f"{GRAY}{k}={RESET}{v_hl}")
+            extra_str = f"{GRAY}({' '.join(extras)}){RESET}" if extras else ""
+
+            parts = [p for p in [t_str, color_level(lvl), caller_str, msg_hl, extra_str] if p]
+            formatted = "  ".join(parts)
+
+    # CASE 7: RabbitMQ
+    if not formatted:
+        rb_match = re.match(r"^(\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:[+\-]\d{2}:\d{2})?)\s+\[(.*?)\]\s+<([0-9\.]+)>[\s\t]*(.*)$", line)
+        if rb_match:
+            _, t, lvl, pid, msg = rb_match.groups()
+            if "." in t:
+                t = t.split(".")[0]
+            detected_level = lvl.upper()
+            msg_hl = colorize_rich_text(msg)
+            formatted = f"{GRAY}{t}{RESET}  {color_level(lvl)}  {CYAN}[RabbitMQ:<{pid}>]{RESET}  {msg_hl}"
+
+    # CASE 8: Redis
+    if not formatted:
+        rd_match = re.match(r"^(\d+:\w)\s+(\d{1,2}\s+\w+\s+\d{4}\s+(\d{2}:\d{2}:\d{2}(?:\.\d+)?))\s+([\*\#\.\-])\s*(.*)$", line)
+        if rd_match:
+            role, _, t, symbol, msg = rd_match.groups()
+            if "." in t:
+                t = t.split(".")[0]
+            detected_level = "WARN" if symbol == "#" else "INFO"
+            msg_hl = colorize_rich_text(msg)
+            formatted = f"{GRAY}{t}{RESET}  {color_level(detected_level)}  {CYAN}[Redis:{role}]{RESET}  {msg_hl}"
+
+    # CASE 9: Nginx Notice
+    if not formatted:
+        nx_match = re.match(r"^(\d{4}/\d{2}/\d{2}\s+(\d{2}:\d{2}:\d{2}))\s+\[(.*?)\]\s+\d+#\d+:\s*(.*)$", line)
+        if nx_match:
+            _, t, lvl, msg = nx_match.groups()
+            detected_level = lvl.upper()
+            msg_hl = colorize_rich_text(msg)
+            formatted = f"{GRAY}{t}{RESET}  {color_level(lvl)}  {CYAN}[Nginx]{RESET}  {msg_hl}"
+
+    # CASE 10: NextJS / Build / Proxy
+    if not formatted:
+        if line.startswith("✓"):
+            return f"{GREEN}{BOLD}✓{RESET} {colorize_rich_text(line[1:].strip())}"
+        if line.startswith("[ws-proxy]"):
+            return f"{CYAN}[ws-proxy]{RESET} {colorize_rich_text(line[10:].strip())}"
+
+    # CASE 11: Stack Traces & Exceptions
+    if not formatted:
+        if line.startswith("at ") or line.startswith("Caused by:") or line.startswith("File \"") or "... " in line:
+            return f"  {RED}{DIM}{line}{RESET}"
+        if any(k in line for k in ["ERROR", "Exception", "Traceback", "failed", "Fatal", "CRITICAL", "panic"]):
+            detected_level = "ERROR"
+            formatted = f"{RED}{colorize_rich_text(line)}{RESET}"
+        elif any(k in line for k in ["WARN", "Warning"]):
+            detected_level = "WARN"
+            formatted = f"{YELLOW}{colorize_rich_text(line)}{RESET}"
+        elif "DEBUG" in line:
+            detected_level = "DEBUG"
+            formatted = f"{BLUE}{colorize_rich_text(line)}{RESET}"
+        else:
+            formatted = colorize_rich_text(line)
+
+    if min_level:
+        req_val = LEVEL_SEVERITY.get(min_level.upper(), 2)
+        cur_val = LEVEL_SEVERITY.get(detected_level.upper(), 2)
+        if cur_val < req_val:
+            return None
+
+    return formatted
+
+def stream_logs(container_name, follow=True, tail=100, min_level=None, search=None, raw_json=False, in_loop=False):
+    docker_cmd = ["docker", "logs", "--tail", str(tail)]
+    if follow:
+        docker_cmd.append("-f")
+    docker_cmd.append(container_name)
+
+    if follow:
+        exit_hint = "Press Ctrl+C to return to container list" if in_loop else "Press Ctrl+C to exit"
+        print(f"{GRAY}Streaming live logs from {CYAN}{container_name}{GRAY}... ({exit_hint}){RESET}\n", flush=True)
+
+    proc = subprocess.Popen(
+        docker_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    try:
+        for line in proc.stdout:
+            out = format_line(line, min_level=min_level, search_pattern=search, raw_json_mode=raw_json)
+            if out:
+                print(out, flush=True)
+    except (BrokenPipeError, IOError):
+        pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.3)
+        except Exception:
+            pass
+
+def run_fzf_interactive():
+    # Restore standard SIGINT handling so KeyboardInterrupt can be caught inside Python
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    preview_script = os.path.realpath(__file__)
+    preview_cmd = f"{preview_script} {{2}} --no-follow -n 200"
+
+    while True:
+        try:
+            out = subprocess.check_output(
+                ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"],
+                text=True
+            ).strip()
+            if not out:
+                print(f"{RED}No running Docker containers found.{RESET}")
+                break
+
+            lines = [f"\033[1;36m  {'NAME':<34} {'STATUS':<24} {'IMAGE':<32}\033[0m"]
+            for row in out.split("\n"):
+                parts = row.split("\t")
+                name = parts[0]
+                status = parts[1] if len(parts) > 1 else ""
+                image = parts[2] if len(parts) > 2 else ""
+                dot = "\033[32m●\033[0m" if status.startswith("Up") else "\033[31m○\033[0m"
+                lines.append(f"{dot} \033[1;97m{name:<34}\033[0m \033[90m{status:<24}\033[0m \033[36m{image:<32}\033[0m")
+
+            fzf_cmd = [
+                "fzf",
+                "--ansi",
+                "--header-lines=1",
+                "--layout=reverse",
+                "--border=rounded",
+                "--prompt=🐳 Docker Logs > ",
+                "--header=[Enter] Open Live Log  |  [Shift-↑/↓ / PageUp/Dn] Scroll  |  [Ctrl-E] Shell  |  [Esc / Ctrl-C] Exit",
+                f"--preview={preview_cmd}",
+                "--preview-window=right:68%:wrap:border-rounded:follow",
+                # Preview Scroll Hotkeys (Smooth & Freeze-Free)
+                "--bind=shift-up:preview-up",
+                "--bind=shift-down:preview-down",
+                "--bind=alt-up:preview-up",
+                "--bind=alt-down:preview-down",
+                "--bind=page-up:preview-page-up",
+                "--bind=page-down:preview-page-down",
+                "--bind=ctrl-u:preview-half-page-up",
+                "--bind=ctrl-d:preview-half-page-down",
+                "--bind=ctrl-b:preview-page-up",
+                "--bind=ctrl-f:preview-page-down",
+                "--bind=home:preview-top",
+                "--bind=end:preview-bottom",
+                # Container Actions
+                "--bind=ctrl-e:execute(docker exec -it {2} sh || docker exec -it {2} bash)",
+                "--bind=ctrl-o:execute(docker restart {2} >/dev/null)",
+            ]
+
+            fzf_proc = subprocess.Popen(
+                fzf_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True
+            )
+            selected_line, _ = fzf_proc.communicate(input="\n".join(lines))
+            
+            # If user pressed Esc or Ctrl-C inside FZF main menu, exit completely
+            if fzf_proc.returncode != 0 or not selected_line.strip():
+                break
+
+            tokens = selected_line.strip().split()
+            if len(tokens) >= 2:
+                selected_container = tokens[1]
+                print(f"{ESC}[2J{ESC}[H", end="", flush=True)
+                
+                # Stream full detail live logs. Ctrl+C returns cleanly to this while loop!
+                stream_logs(selected_container, follow=True, tail=100, in_loop=True)
+                
+                # Clear and return to FZF overview
+                print(f"{ESC}[2J{ESC}[H", end="", flush=True)
+
+        except KeyboardInterrupt:
+            # Ctrl+C inside FZF menu itself exits cleanly
+            break
+        except Exception as e:
+            print(f"{RED}Error: {e}{RESET}")
+            break
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="dlog: Universal Smart & Beautiful Docker Log Streamer & Interactive FZF Explorer",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("container", nargs="?", help="Docker container name or ID (leave blank for interactive FZF picker)")
+    parser.add_argument("-f", "--follow", action="store_true", default=True, help="Follow log output in real-time (default: true)")
+    parser.add_argument("--no-follow", dest="follow", action="store_false", help="Do not follow log stream")
+    parser.add_argument("-n", "--tail", default="100", help="Number of lines to show from end of logs (default: 100)")
+    parser.add_argument("-l", "--level", choices=["debug", "info", "warn", "error"], help="Filter logs by minimum severity level")
+    parser.add_argument("-s", "--search", help="Regex or keyword filter")
+    parser.add_argument("-m", "--json", action="store_true", help="Pretty-print full multiline JSON payloads")
+    args = parser.parse_args()
+
+    # Priority 1: If container is specified, ALWAYS stream that container
+    if args.container:
+        stream_logs(
+            args.container,
+            follow=args.follow,
+            tail=args.tail,
+            min_level=args.level,
+            search=args.search,
+            raw_json=args.json,
+            in_loop=False
+        )
+        return
+
+    # Priority 2: If no container and piped from stdin, format stdin
+    if not sys.stdin.isatty():
+        try:
+            for line in sys.stdin:
+                out = format_line(line, min_level=args.level, search_pattern=args.search, raw_json_mode=args.json)
+                if out:
+                    print(out, flush=True)
+        except (BrokenPipeError, IOError):
+            sys.exit(0)
+        return
+
+    # Priority 3: Interactive terminal with no container -> Open FZF Explorer Loop
+    run_fzf_interactive()
+
+if __name__ == "__main__":
+    main()
