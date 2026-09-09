@@ -67,6 +67,26 @@ pmem --inspect 1234
 
 ---
 
+### 3. `herdr-remote` — Mobile Touch Deck & Remote for `herdr` Terminal Agent Multiplexer
+Secure mobile web companion and WebSocket gateway for the `herdr` terminal agent multiplexer.
+
+- **Hands-Free Agent Supervision**: Control active terminal sessions and Antigravity (`agy`) coding agents from your smartphone over Wi-Fi.
+- **1-Tap Voice Mode Trigger**: Toggle native voice mode and dictation in terminal agent panes hands-free.
+- **Multi-OS Prebuilt Binaries**: Self-contained single-binary with embedded React PWA assets, organized under `bin/herdr-remote/` (`linux-x86_64`, `darwin-arm64`, `darwin-x86_64`).
+- **Auto-Linking Installer**: `./install.sh` automatically detects host OS and architecture to link the appropriate binary as `herdr-remote` (and `remote` alias).
+
+```bash
+# Launch companion server and display QR code in terminal
+herdr-remote
+
+# Or use the quick alias
+remote
+
+# Connect via phone by scanning QR code or navigating to printed LAN IP
+```
+
+---
+
 ## 📦 Installation & Setup
 
 ### Prerequisites

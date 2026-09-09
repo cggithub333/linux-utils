@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-TARGET_DIR="${HOME}/.local/bin"
+TARGET_DIR="${TARGET_DIR:-${HOME}/.local/bin}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin"
 
 echo "=========================================="
@@ -48,15 +48,52 @@ fi
 echo ""
 echo "==> Symlinking binaries into ${TARGET_DIR}..."
 
-for script in "${SOURCE_DIR}"/*; do
-    if [ -f "$script" ]; then
-        name="$(basename "$script")"
-        chmod +x "$script"
-        ln -sf "$script" "${TARGET_DIR}/${name}"
+# Detect current host platform
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+
+case "$ARCH" in
+    x86_64|amd64) ARCH_TAG="x86_64" ;;
+    aarch64|arm64) ARCH_TAG="arm64" ;;
+    *) ARCH_TAG="$ARCH" ;;
+esac
+
+for item in "${SOURCE_DIR}"/*; do
+    [ -L "$item" ] && continue
+    name="$(basename "$item")"
+    if [ -f "$item" ]; then
+        chmod +x "$item"
+        ln -sf "$item" "${TARGET_DIR}/${name}"
         echo "  [+] Linked ${name} -> ${TARGET_DIR}/${name}"
+    elif [ -d "$item" ]; then
+        # Multi-OS directory tool (e.g. bin/herdr-remote/)
+        CANDIDATES=(
+            "${item}/${OS}-${ARCH_TAG}/${name}"
+            "${item}/${OS}-${ARCH}/${name}"
+            "${item}/${OS}/${name}"
+        )
+        LINKED=0
+        for candidate in "${CANDIDATES[@]}"; do
+            if [ -f "$candidate" ]; then
+                chmod +x "$candidate"
+                ln -sf "$candidate" "${TARGET_DIR}/${name}"
+                echo "  [+] Linked ${name} (${OS}-${ARCH_TAG}) -> ${TARGET_DIR}/${name}"
+                LINKED=1
+                break
+            fi
+        done
+        if [ $LINKED -eq 0 ]; then
+            echo "  [!] No prebuilt ${name} binary found for ${OS}-${ARCH_TAG} in ${item}"
+        fi
     fi
 done
 
+# If herdr-remote was installed, provide convenient 'remote' alias
+if [ -f "${TARGET_DIR}/herdr-remote" ]; then
+    ln -sf herdr-remote "${TARGET_DIR}/remote"
+    echo "  [+] Linked alias remote -> ${TARGET_DIR}/herdr-remote"
+fi
+
 echo ""
 echo "Installation complete! Ensure '${TARGET_DIR}' is in your PATH."
-echo "You can now run: dlog --help, pmem --help"
+echo "You can now run: dlog --help, pmem --help, herdr-remote --help (or remote --help)"
