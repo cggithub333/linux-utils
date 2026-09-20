@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+"""
+dps: Universal Smart, Fast & Beautiful Docker Container Explorer & Process Viewer
+
+Features:
+- Beautiful colorful table view for all Docker containers (`docker ps -a`)
+- 'NO' numbering column as the first column for quick scanning
+- Smart status-based ID coloring (Exited = Red, Unhealthy = Orange, Running = Cyan)
+- Nerd Font icons for containers, states, health checks, ports, networks, and compose stacks
+- Live auto-refresh watch dashboard (-w, --watch [interval])
+- Interactive FZF explorer (-i, --fzf) with rich preview (logs, inspect, network, mounts)
+- Group by Docker Compose project / stack (-g, --group) with service name display
+- Deep container inspection card (--inspect <name_or_id>)
+- Powerful search & filtering by name, image, stack, port, state (-q, -r, -s, -p)
+- Clean port mapping formatting with deduplication & OSC 8 clickable web links
+- Machine-readable JSON export mode (--json)
+- Automatic terminal width adaptation & ANSI color detection
+"""
+import sys
+import os
+import re
+import time
+import json
+import signal
+import shutil
+import datetime
+import argparse
+import subprocess
+
+# Handle SIGPIPE cleanly for unix pipelines and fzf
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+# --- ANSI Color & Styling ---
+ESC = "\033"
+RESET = f"{ESC}[0m"
+BOLD = f"{ESC}[1m"
+DIM = f"{ESC}[2m"
+ITALIC = f"{ESC}[3m"
+UNDERLINE = f"{ESC}[4m"
+
+# Palette
+RED = f"{ESC}[31m"
+BRIGHT_RED = f"{ESC}[91m"
+GREEN = f"{ESC}[32m"
+BRIGHT_GREEN = f"{ESC}[92m"
+YELLOW = f"{ESC}[33m"
+BRIGHT_YELLOW = f"{ESC}[93m"
+ORANGE = f"{ESC}[38;5;208m"
+BLUE = f"{ESC}[34m"
+MAGENTA = f"{ESC}[35m"
+CYAN = f"{ESC}[36m"
+ELECTRIC_CYAN = f"{ESC}[38;5;45m"
+SKY_BLUE = f"{ESC}[38;5;81m"
+PURPLE = f"{ESC}[38;5;141m"
+GRAY = f"{ESC}[90m"
+WHITE = f"{ESC}[97m"
+MUTED = f"{ESC}[38;5;244m"
+BG_DARK = f"{ESC}[48;5;236m"
+
+ANSI_STRIP_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+def disable_colors():
+    global RESET, BOLD, DIM, ITALIC, UNDERLINE, RED, BRIGHT_RED, GREEN, BRIGHT_GREEN
+    global YELLOW, BRIGHT_YELLOW, ORANGE, BLUE, MAGENTA, CYAN, ELECTRIC_CYAN, SKY_BLUE, PURPLE, GRAY, WHITE, MUTED, BG_DARK
+    RESET = BOLD = DIM = ITALIC = UNDERLINE = ""
+    RED = BRIGHT_RED = GREEN = BRIGHT_GREEN = YELLOW = BRIGHT_YELLOW = ORANGE = ""
+    BLUE = MAGENTA = CYAN = ELECTRIC_CYAN = SKY_BLUE = PURPLE = GRAY = WHITE = MUTED = BG_DARK = ""
+
+def strip_ansi(s):
+    return ANSI_STRIP_REGEX.sub('', str(s))
+
+def visible_len(s):
+    return len(strip_ansi(s))
+
+def pad_visible(s, width, align='left'):
+    vlen = visible_len(s)
+    diff = max(0, width - vlen)
+    if align == 'right':
+        return (' ' * diff) + s
+    elif align == 'center':
+        left = diff // 2
+        right = diff - left
+        return (' ' * left) + s + (' ' * right)
+    else:
+        return s + (' ' * diff)
+
+def truncate_visible(s, max_len):
+    if visible_len(s) <= max_len:
+        return s
+    plain = strip_ansi(s)
+    if len(plain) <= max_len:
+        return s
+    return plain[:max_len - 1] + "…"
+
+def make_clickable_url(url, label=None):
+    if label is None:
+        label = url
+    return f"{ESC}]8;;{url}{ESC}\\{label}{ESC}]8;;{ESC}\\"
+
+# --- Port Parser & Formatter ---
+def parse_ports(raw_ports):
+    """
+    Parses docker port string into a structured, deduplicated list.
+    Raw example:
+      0.0.0.0:8092->8082/tcp, [::]:8092->8082/tcp, 8080/tcp, 0.0.0.0:4317-4318->4317-4318/tcp
+    """
+    if not raw_ports:
+        return []
+    
+    parts = [p.strip() for p in raw_ports.split(",") if p.strip()]
+    mappings = []
+    seen = set()
+
+    for p in parts:
+        # Match host:container mapping (IPv4 or IPv6 or localhost)
+        m = re.search(r'(?:(?:[\d\.]+|\[[\w:]+\]):)?(\d+(?:-\d+)?)\s*->\s*(\d+(?:-\d+)?)(?:/(\w+))?', p)
+        if m:
+            host_port = m.group(1)
+            container_port = m.group(2)
+            proto = m.group(3) or "tcp"
+            key = (host_port, container_port, proto)
+            if key not in seen:
+                seen.add(key)
+                mappings.append({
+                    "type": "mapped",
+                    "host": host_port,
+                    "container": container_port,
+                    "proto": proto
+                })
+            continue
+
+        # Match unmapped exposed port: 8080/tcp or 5775/udp
+        m_exp = re.search(r'(\d+(?:-\d+)?)(?:/(\w+))?', p)
+        if m_exp:
+            port = m_exp.group(1)
+            proto = m_exp.group(2) or "tcp"
+            key = ("exposed", port, proto)
+            if key not in seen:
+                seen.add(key)
+                mappings.append({
+                    "type": "exposed",
+                    "port": port,
+                    "proto": proto
+                })
+
+    return mappings
+
+def format_ports_clean(raw_ports, enable_links=True):
+    mappings = parse_ports(raw_ports)
+    if not mappings:
+        return f"{GRAY}—{RESET}"
+
+    formatted_items = []
+    for m in mappings:
+        if m["type"] == "mapped":
+            h_port = m["host"]
+            c_port = m["container"]
+            
+            # Web ports detection for OSC 8 clickable link
+            is_web = False
+            first_port = h_port.split("-")[0]
+            if first_port.isdigit():
+                p_num = int(first_port)
+                if p_num in [80, 443, 3000, 3001, 3002, 3333, 4000, 5000, 5173, 5505, 8000, 8080, 8081, 8082, 8083, 8084, 8085, 8087, 8090, 8091, 8092, 8094, 8095, 8096, 8097, 9080, 9090, 9091, 9443, 15672, 16686]:
+                    is_web = True
+
+            proto_str = f"/{m['proto']}" if m['proto'] != "tcp" else ""
+            
+            if h_port == c_port:
+                port_repr = f"{BOLD}{ELECTRIC_CYAN}{h_port}{RESET}{GRAY}{proto_str}{RESET}"
+            else:
+                port_repr = f"{BOLD}{BRIGHT_GREEN}{h_port}{RESET}{MUTED}→{RESET}{CYAN}{c_port}{RESET}{GRAY}{proto_str}{RESET}"
+
+            if enable_links and is_web and first_port.isdigit():
+                scheme = "https" if first_port in ["443", "9443"] else "http"
+                url = f"{scheme}://localhost:{first_port}"
+                clickable = make_clickable_url(url, port_repr)
+                formatted_items.append(clickable)
+            else:
+                formatted_items.append(port_repr)
+        else:
+            # Exposed only
+            proto_str = f"/{m['proto']}" if m['proto'] != "tcp" else ""
+            formatted_items.append(f"{GRAY}{m['port']}{proto_str}{RESET}")
+
+    return f"{GRAY}, {RESET}".join(formatted_items)
+
+# --- Container ID Status Coloring ---
+def format_container_id(short_id, state, health):
+    """
+    Format Container ID with status-driven colors:
+    - Exited / Dead: Bold Bright Red
+    - Unhealthy: Bold Orange
+    - Restarting: Bold Orange
+    - Paused: Bold Bright Yellow
+    - Running: Cyan
+    """
+    state_lower = (state or "").lower()
+    health_lower = (health or "").lower()
+
+    if state_lower in ["exited", "dead"]:
+        return f"{BOLD}{BRIGHT_RED}󰈚 {short_id}{RESET}"
+    elif health_lower == "unhealthy":
+        return f"{BOLD}{ORANGE}󰈚 {short_id}{RESET}"
+    elif state_lower == "restarting":
+        return f"{BOLD}{ORANGE}󰈚 {short_id}{RESET}"
+    elif state_lower == "paused":
+        return f"{BOLD}{BRIGHT_YELLOW}󰈚 {short_id}{RESET}"
+    else:
+        return f"{GRAY}󰈚 {RESET}{ELECTRIC_CYAN}{short_id}{RESET}"
+
+# --- Container Status & Icon Formatter ---
+def format_container_status(state, status, health):
+    state_lower = (state or "").lower()
+    status_str = status or ""
+    health_lower = (health or "").lower()
+
+    if state_lower == "running":
+        if health_lower == "healthy":
+            icon = f"{BOLD}{BRIGHT_GREEN}󰄬{RESET}"
+            text = f"{BRIGHT_GREEN}{status_str}{RESET}"
+        elif health_lower == "unhealthy":
+            icon = f"{BOLD}{BRIGHT_RED}󰅚{RESET}"
+            text = f"{BRIGHT_RED}{status_str}{RESET}"
+        elif health_lower == "starting":
+            icon = f"{BOLD}{BRIGHT_YELLOW}󰔟{RESET}"
+            text = f"{BRIGHT_YELLOW}{status_str}{RESET}"
+        else:
+            icon = f"{BOLD}{GREEN}●{RESET}"
+            text = f"{GREEN}{status_str}{RESET}"
+    elif state_lower == "exited":
+        icon = f"{BOLD}{RED}󰅙{RESET}"
+        if "exited (0)" in status_str.lower():
+            text = f"{GRAY}{status_str}{RESET}"
+        else:
+            text = f"{BOLD}{BRIGHT_RED}{status_str}{RESET}"
+    elif state_lower == "paused":
+        icon = f"{BOLD}{BRIGHT_YELLOW}󰏤{RESET}"
+        text = f"{BRIGHT_YELLOW}{status_str}{RESET}"
+    elif state_lower == "restarting":
+        icon = f"{BOLD}{ORANGE}󰔟{RESET}"
+        text = f"{ORANGE}{status_str}{RESET}"
+    elif state_lower == "dead":
+        icon = f"{BOLD}{BRIGHT_RED}󰚌{RESET}"
+        text = f"{BOLD}{RED}{status_str}{RESET}"
+    elif state_lower == "created":
+        icon = f"{BOLD}{SKY_BLUE}󰈚{RESET}"
+        text = f"{SKY_BLUE}{status_str}{RESET}"
+    else:
+        icon = f"{GRAY}○{RESET}"
+        text = f"{MUTED}{status_str}{RESET}"
+
+    return icon, text
+
+def format_image_name(img, max_len=None):
+    if not img:
+        return f"{GRAY}—{RESET}"
+    if img.startswith("sha256:"):
+        return f"{GRAY}{img[:19]}…{RESET}"
+    
+    if max_len and len(img) > max_len:
+        img = img[:max_len - 1] + "…"
+
+    if ":" in img:
+        repo, tag = img.rsplit(":", 1)
+        return f"{WHITE}{repo}{RESET}{GRAY}:{RESET}{BRIGHT_YELLOW}{tag}{RESET}"
+    return f"{WHITE}{img}{RESET}"
+
+# --- Data Collection ---
+def collect_containers(all_containers=True, search=None, running_only=False, stopped_only=False, project=None, sort_by="name", reverse=False):
+    """
+    Executes docker ps with JSON formatting to retrieve container list.
+    """
+    cmd = ["docker", "ps", "--no-trunc", "--format", "json"]
+    if all_containers or stopped_only:
+        cmd.append("-a")
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        print(f"{BOLD}{BRIGHT_RED}Error:{RESET} 'docker' CLI not found in PATH.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"{BOLD}{BRIGHT_RED}Error running docker ps:{RESET} {e.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    containers = []
+    lines = proc.stdout.strip().split("\n")
+    
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        cid = item.get("ID", "")
+        short_id = cid[:12] if len(cid) >= 12 else cid
+        name = item.get("Names", "").lstrip("/")
+        image = item.get("Image", "")
+        command = item.get("Command", "").strip('"')
+        created_at = item.get("CreatedAt", "")
+        running_for = item.get("RunningFor", "")
+        status = item.get("Status", "")
+        state = item.get("State", "")
+        health = item.get("HealthStatus", "none")
+        ports = item.get("Ports", "")
+        networks = item.get("Networks", "")
+        mounts = item.get("Mounts", "")
+        labels_str = item.get("Labels", "")
+
+        # Parse labels into dict
+        labels = {}
+        if labels_str:
+            for l_entry in labels_str.split(","):
+                if "=" in l_entry:
+                    k, v = l_entry.split("=", 1)
+                    labels[k.strip()] = v.strip()
+
+        stack_project = labels.get("com.docker.compose.project") or ""
+        service_name = labels.get("com.docker.compose.service") or ""
+
+        # Filtering
+        if running_only and state.lower() != "running":
+            continue
+        if stopped_only and state.lower() == "running":
+            continue
+        if project and stack_project.lower() != project.lower():
+            continue
+
+        if search:
+            pat = str(search).lower()
+            haystack = f"{cid} {short_id} {name} {image} {command} {status} {state} {ports} {networks} {stack_project} {service_name}".lower()
+            if pat not in haystack:
+                continue
+
+        containers.append({
+            "id": cid,
+            "short_id": short_id,
+            "name": name,
+            "image": image,
+            "command": command,
+            "created_at": created_at,
+            "running_for": running_for,
+            "status": status,
+            "state": state,
+            "health": health,
+            "ports": ports,
+            "networks": networks,
+            "mounts": mounts,
+            "stack": stack_project,
+            "service": service_name,
+            "labels": labels
+        })
+
+    # Sort
+    sort_key = (sort_by or "name").lower()
+    if sort_key == "name":
+        containers.sort(key=lambda x: x["name"].lower(), reverse=reverse)
+    elif sort_key == "id":
+        containers.sort(key=lambda x: x["short_id"], reverse=reverse)
+    elif sort_key == "image":
+        containers.sort(key=lambda x: x["image"].lower(), reverse=reverse)
+    elif sort_key == "status" or sort_key == "state":
+        # Order running first, then exited
+        containers.sort(key=lambda x: (0 if x["state"] == "running" else 1, x["name"].lower()), reverse=reverse)
+    elif sort_key == "created" or sort_key == "age":
+        containers.sort(key=lambda x: x["created_at"], reverse=reverse)
+    elif sort_key == "stack" or sort_key == "project":
+        containers.sort(key=lambda x: (x["stack"].lower(), x["name"].lower()), reverse=reverse)
+    elif sort_key == "ports":
+        containers.sort(key=lambda x: x["ports"], reverse=reverse)
+
+    return containers
+
+# --- Grouping Mode ---
+def group_containers_by_stack(containers):
+    stacks = {}
+    for c in containers:
+        stack_name = c["stack"] or "standalone"
+        if stack_name not in stacks:
+            stacks[stack_name] = {
+                "name": stack_name,
+                "is_compose": bool(c["stack"]),
+                "containers": []
+            }
+        stacks[stack_name]["containers"].append(c)
+
+    # Sort stacks: named compose stacks first, standalone last
+    res = list(stacks.values())
+    res.sort(key=lambda s: (0 if s["is_compose"] else 1, s["name"].lower()))
+    return res
+
+# --- System Header View ---
+def print_docker_header(containers, search=None, project=None, running_only=False, stopped_only=False):
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    box_width = max(80, min(term_width - 2, 120))
+
+    total = len(containers)
+    running = sum(1 for c in containers if c["state"].lower() == "running")
+    exited = sum(1 for c in containers if c["state"].lower() == "exited")
+    paused = sum(1 for c in containers if c["state"].lower() == "paused")
+    restarting = sum(1 for c in containers if c["state"].lower() == "restarting")
+    healthy = sum(1 for c in containers if c["health"].lower() == "healthy")
+    unhealthy = sum(1 for c in containers if c["health"].lower() == "unhealthy")
+
+    stacks_count = len(set(c["stack"] for c in containers if c["stack"]))
+
+    # Line 1: Summary Counts
+    l1 = (
+        f" {BOLD}{ELECTRIC_CYAN}󰡨 Docker Overview{RESET}  {SKY_BLUE}│{RESET} "
+        f"Total: {BOLD}{WHITE}{total}{RESET}  {SKY_BLUE}│{RESET} "
+        f"{GREEN}󰐌 Running:{RESET} {BOLD}{BRIGHT_GREEN}{running}{RESET}  {SKY_BLUE}│{RESET} "
+        f"{RED}󰅙 Exited:{RESET} {BOLD}{BRIGHT_RED if exited > 0 else GRAY}{exited}{RESET}  {SKY_BLUE}│{RESET} "
+        f"{YELLOW}󰏤 Paused:{RESET} {BOLD}{BRIGHT_YELLOW if paused > 0 else GRAY}{paused}{RESET}  {SKY_BLUE}│{RESET} "
+        f"{ORANGE}󰔟 Restarting:{RESET} {BOLD}{ORANGE if restarting > 0 else GRAY}{restarting}{RESET}"
+    )
+
+    # Line 2: Health & Stacks
+    filter_parts = []
+    if search:
+        filter_parts.append(f"Search: {BOLD}{YELLOW}󰍉 '{search}'{RESET}")
+    if project:
+        filter_parts.append(f"Stack: {BOLD}{PURPLE}󰄫 {project}{RESET}")
+    if running_only:
+        filter_parts.append(f"Mode: {BOLD}{BRIGHT_GREEN}Running Only{RESET}")
+    if stopped_only:
+        filter_parts.append(f"Mode: {BOLD}{BRIGHT_RED}Stopped Only{RESET}")
+    filter_str = f"  {SKY_BLUE}│{RESET}  {' '.join(filter_parts)}" if filter_parts else ""
+
+    l2 = (
+        f" {BOLD}{PURPLE}󱂬 Composition{RESET}      {SKY_BLUE}│{RESET} "
+        f"Stacks: {BOLD}{PURPLE}{stacks_count}{RESET}  {SKY_BLUE}│{RESET} "
+        f"{BRIGHT_GREEN}󰄬 Healthy:{RESET} {BOLD}{BRIGHT_GREEN}{healthy}{RESET}  {SKY_BLUE}│{RESET} "
+        f"{BRIGHT_RED}󰅚 Unhealthy:{RESET} {BOLD}{BRIGHT_RED if unhealthy > 0 else GRAY}{unhealthy}{RESET}"
+        f"{filter_str}"
+    )
+
+    border_top = f"{SKY_BLUE}╭{'─' * box_width}╮{RESET}"
+    border_bot = f"{SKY_BLUE}╰{'─' * box_width}╯{RESET}"
+
+    print(border_top)
+    print(f"{SKY_BLUE}│{RESET}{pad_visible(l1, box_width)}{SKY_BLUE}│{RESET}")
+    print(f"{SKY_BLUE}│{RESET}{pad_visible(l2, box_width)}{SKY_BLUE}│{RESET}")
+    print(border_bot)
+
+# --- Table Renderer ---
+def render_table(containers, limit=None, hide_stack=False, show_service=False, start_index=1):
+    if not containers:
+        print(f"\n  {GRAY}󰚌 No containers found matching criteria.{RESET}\n")
+        return
+
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    shown = containers if (limit is None or limit <= 0) else containers[:limit]
+
+    # Calculate dynamic column widths
+    no_w = 4
+    id_w = 15
+
+    max_name = max(len(c["name"]) for c in shown)
+    name_w = max(16, min(max_name + 4, 32))
+
+    max_img = max(len(c["image"]) for c in shown)
+    img_w = max(16, min(max_img + 2, 30))
+
+    max_stat = max(visible_len(format_container_status(c["state"], c["status"], c["health"])[1]) for c in shown)
+    status_w = max(20, min(max_stat + 2, 28))
+
+    max_stack = max(visible_len(c["stack"]) for c in shown)
+    stack_w = max(12, min(max_stack + 4, 26))
+
+    max_srv = max(visible_len(c.get("service", "") or "—") for c in shown)
+    srv_w = max(12, min(max_srv + 4, 24))
+
+    # Header composition
+    hdr_parts = [
+        f"  {BOLD}{ELECTRIC_CYAN}{'NO':<{no_w}}",
+        f"{'ID':<{id_w}}",
+        f"{'NAME':<{name_w}}",
+        f"{'STATUS':<{status_w}}"
+    ]
+    sep_parts = [
+        f"{SKY_BLUE}  {'─' * (no_w - 1)}",
+        f"{'─' * (id_w - 1)}",
+        f"{'─' * (name_w - 1)}",
+        f"{'─' * (status_w - 1)}"
+    ]
+    total_used = no_w + id_w + name_w + status_w + 5
+
+    if show_service:
+        hdr_parts.append(f"{'SERVICE':<{srv_w}}")
+        sep_parts.append(f"{'─' * (srv_w - 1)}")
+        total_used += srv_w + 1
+    elif not hide_stack:
+        hdr_parts.append(f"{'STACK':<{stack_w}}")
+        sep_parts.append(f"{'─' * (stack_w - 1)}")
+        total_used += stack_w + 1
+
+    hdr_parts.append(f"{'IMAGE':<{img_w}}")
+    sep_parts.append(f"{'─' * (img_w - 1)}")
+    total_used += img_w + 1
+
+    ports_w = max(20, term_width - total_used - 2)
+    hdr_parts.append(f"{'PORTS'}{RESET}")
+    sep_parts.append(f"{'─' * ports_w}{RESET}")
+
+    print(" ".join(hdr_parts))
+    print(" ".join(sep_parts))
+
+    for idx, c in enumerate(shown, start=start_index):
+        icon, status_colored = format_container_status(c["state"], c["status"], c["health"])
+        
+        # NO
+        no_str = f"{GRAY}{idx:<{no_w}}{RESET}"
+        
+        # ID (Red if exited, Orange if unhealthy/restarting, Cyan otherwise)
+        id_str = format_container_id(c["short_id"], c["state"], c["health"])
+        
+        # Name
+        name_colored = f"{icon} {BOLD}{WHITE}{c['name']}{RESET}"
+        
+        # Status
+        status_disp = truncate_visible(status_colored, status_w - 2)
+        
+        # Image
+        img_disp = format_image_name(c["image"], max_len=img_w - 2)
+        
+        # Ports
+        ports_disp = format_ports_clean(c["ports"])
+
+        row_parts = [
+            f"  {no_str}",
+            pad_visible(id_str, id_w),
+            pad_visible(name_colored, name_w),
+            pad_visible(status_disp, status_w)
+        ]
+
+        if show_service:
+            srv_str = f"{ELECTRIC_CYAN}{c['service']}{RESET}" if c["service"] else f"{GRAY}—{RESET}"
+            row_parts.append(pad_visible(srv_str, srv_w))
+        elif not hide_stack:
+            if c["stack"]:
+                stack_disp = f"{PURPLE}󰄫 {c['stack']}{RESET}"
+            else:
+                stack_disp = f"{GRAY}—{RESET}"
+            row_parts.append(pad_visible(stack_disp, stack_w))
+
+        row_parts.append(pad_visible(img_disp, img_w))
+        row_parts.append(ports_disp)
+
+        print(" ".join(row_parts))
+
+# --- Grouped Stacks Renderer ---
+def render_grouped_table(groups, limit=None):
+    current_idx = 1
+    for g in groups:
+        c_list = g["containers"]
+        running_cnt = sum(1 for c in c_list if c["state"].lower() == "running")
+        total_cnt = len(c_list)
+        
+        if g["is_compose"]:
+            stack_header = f"{BOLD}{PURPLE}󱂬 Stack: {g['name']}{RESET}  {GRAY}({running_cnt}/{total_cnt} running){RESET}"
+        else:
+            stack_header = f"{BOLD}{MUTED}󰡨 Standalone Containers{RESET}  {GRAY}({running_cnt}/{total_cnt} running){RESET}"
+
+        print(f"\n  {stack_header}")
+        render_table(c_list, limit=limit, hide_stack=True, show_service=g["is_compose"], start_index=current_idx)
+        current_idx += len(c_list)
+
+# --- Deep Container Inspection Card ---
+def inspect_container(name_or_id):
+    try:
+        proc = subprocess.run(["docker", "inspect", name_or_id], capture_output=True, text=True, check=True)
+        data = json.loads(proc.stdout)
+        if not data:
+            print(f"{BOLD}{RED}Error:{RESET} Container '{name_or_id}' not found.", file=sys.stderr)
+            return
+        info = data[0]
+    except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"{BOLD}{RED}Error inspecting container '{name_or_id}':{RESET} {e}", file=sys.stderr)
+        return
+
+    term_width = shutil.get_terminal_size((100, 24)).columns
+    box_w = max(70, min(term_width - 2, 100))
+
+    cid = info.get("Id", "")[:12]
+    full_id = info.get("Id", "")
+    name = info.get("Name", "").lstrip("/")
+    created = info.get("Created", "")
+    state_obj = info.get("State", {})
+    state_str = state_obj.get("Status", "unknown")
+    pid = state_obj.get("Pid", 0)
+    exit_code = state_obj.get("ExitCode", 0)
+    started_at = state_obj.get("StartedAt", "")
+    finished_at = state_obj.get("FinishedAt", "")
+
+    # Health
+    health_obj = state_obj.get("Health", {})
+    health_status = health_obj.get("Status", "none")
+
+    # Image & Config
+    cfg = info.get("Config", {})
+    image_name = cfg.get("Image", "")
+    entrypoint = cfg.get("Entrypoint") or []
+    cmd = cfg.get("Cmd") or []
+    env_vars = cfg.get("Env") or []
+    work_dir = cfg.get("WorkingDir") or "/"
+
+    # HostConfig
+    host_cfg = info.get("HostConfig", {})
+    restart_policy = host_cfg.get("RestartPolicy", {}).get("Name", "no")
+    mem_limit = host_cfg.get("Memory", 0)
+    cpu_shares = host_cfg.get("CpuShares", 0)
+
+    # Network
+    net_settings = info.get("NetworkSettings", {})
+    networks = net_settings.get("Networks", {})
+    ports = net_settings.get("Ports", {})
+
+    # Mounts
+    mounts = info.get("Mounts", [])
+
+    # Labels
+    labels = cfg.get("Labels", {})
+    stack = labels.get("com.docker.compose.project", "standalone")
+    service = labels.get("com.docker.compose.service", "")
+
+    print(f"\n{SKY_BLUE}╭─ {BOLD}{ELECTRIC_CYAN}󰡨 Docker Container Inspection: {WHITE}{name}{SKY_BLUE} {'─' * max(2, box_w - len(name) - 34)}╮{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}Container ID:{RESET}   {ELECTRIC_CYAN}{cid}{RESET} {GRAY}({full_id}){RESET}")
+    if service:
+        print(f"{SKY_BLUE}│{RESET}  {BOLD}Compose Stack:{RESET}  {PURPLE}󰄫 {stack}{RESET} {GRAY}(service: {service}){RESET}")
+    else:
+        print(f"{SKY_BLUE}│{RESET}  {BOLD}Compose Stack:{RESET}  {GRAY}standalone{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}Image:{RESET}          {WHITE}{image_name}{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}State / Status:{RESET} {GREEN if state_str == 'running' else RED}{state_str.upper()}{RESET} {GRAY}(PID: {pid}, ExitCode: {exit_code}){RESET}")
+    if health_status != "none":
+        h_color = BRIGHT_GREEN if health_status == "healthy" else (BRIGHT_RED if health_status == "unhealthy" else BRIGHT_YELLOW)
+        print(f"{SKY_BLUE}│{RESET}  {BOLD}Health Check:{RESET}   {h_color}󰄬 {health_status}{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}Created At:{RESET}     {MUTED}{created}{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}Started At:{RESET}     {MUTED}{started_at}{RESET}")
+    if state_str != "running" and finished_at:
+        print(f"{SKY_BLUE}│{RESET}  {BOLD}Finished At:{RESET}    {MUTED}{finished_at}{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}Working Dir:{RESET}    {WHITE}{work_dir}{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}Command:{RESET}        {BRIGHT_YELLOW}{' '.join(cmd) if cmd else '—'}{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}Restart Policy:{RESET} {CYAN}{restart_policy}{RESET}")
+    
+    # Networks & IPs
+    print(f"{SKY_BLUE}├{'─' * box_w}┤{RESET}")
+    print(f"{SKY_BLUE}│{RESET}  {BOLD}{SKY_BLUE}󰛄 Networks & IP Addresses:{RESET}")
+    for net_name, net_val in networks.items():
+        ip = net_val.get("IPAddress", "")
+        gw = net_val.get("Gateway", "")
+        mac = net_val.get("MacAddress", "")
+        print(f"{SKY_BLUE}│{RESET}    • {BOLD}{CYAN}{net_name}{RESET}: IP={BRIGHT_GREEN}{ip or 'host'}{RESET} Gateway={MUTED}{gw or '—'}{RESET} MAC={GRAY}{mac or '—'}{RESET}")
+
+    # Port bindings
+    if ports:
+        print(f"{SKY_BLUE}│{RESET}  {BOLD}{SKY_BLUE}󰢱 Port Bindings:{RESET}")
+        for c_port, bindings in ports.items():
+            if bindings:
+                for b in bindings:
+                    h_ip = b.get("HostIp", "")
+                    h_port = b.get("HostPort", "")
+                    print(f"{SKY_BLUE}│{RESET}    • {BOLD}{BRIGHT_GREEN}{h_ip}:{h_port}{RESET} {MUTED}→{RESET} {CYAN}{c_port}{RESET}")
+            else:
+                print(f"{SKY_BLUE}│{RESET}    • {GRAY}{c_port} (exposed unmapped){RESET}")
+
+    # Mounts
+    if mounts:
+        print(f"{SKY_BLUE}├{'─' * box_w}┤{RESET}")
+        print(f"{SKY_BLUE}│{RESET}  {BOLD}{SKY_BLUE}󰉋 Volume Mounts ({len(mounts)}):{RESET}")
+        for m in mounts:
+            src = m.get("Source", "")
+            dst = m.get("Destination", "")
+            rw = "rw" if m.get("RW", True) else "ro"
+            m_type = m.get("Type", "bind")
+            print(f"{SKY_BLUE}│{RESET}    • {MUTED}[{m_type}/{rw}]{RESET} {WHITE}{src}{RESET} {SKY_BLUE}→{RESET} {ELECTRIC_CYAN}{dst}{RESET}")
+
+    # Top Environment Variables
+    if env_vars:
+        print(f"{SKY_BLUE}├{'─' * box_w}┤{RESET}")
+        print(f"{SKY_BLUE}│{RESET}  {BOLD}{SKY_BLUE}󰈚 Environment Variables ({len(env_vars)}):{RESET}")
+        for ev in env_vars[:12]:
+            if "=" in ev:
+                k, v = ev.split("=", 1)
+                if any(sec in k.lower() for sec in ["secret", "pass", "key", "token"]):
+                    v = "******"
+                print(f"{SKY_BLUE}│{RESET}    • {BOLD}{ELECTRIC_CYAN}{k}{RESET}={WHITE}{v}{RESET}")
+        if len(env_vars) > 12:
+            print(f"{SKY_BLUE}│{RESET}    {GRAY}… and {len(env_vars) - 12} more environment variables{RESET}")
+
+    print(f"{SKY_BLUE}╰{'─' * box_w}╯{RESET}\n")
+
+# --- Interactive FZF Mode ---
+def run_fzf_mode(containers):
+    script_path = os.path.realpath(__file__)
+    fzf_header = f"{BOLD}{ELECTRIC_CYAN}  {'NO':<4} {'ID':<12} {'STATE':<10} {'NAME':<28} {'STACK':<16} {'IMAGE':<24} PORTS{RESET}"
+    lines = [fzf_header]
+
+    for idx, c in enumerate(containers, 1):
+        line = f"  {idx:<4} {c['short_id']:<12} {c['state']:<10} {c['name']:<28} {(c['stack'] or '—'):<16} {c['image'][:23]:<24} {c['ports']}"
+        lines.append(line)
+
+    preview_cmd = f"{script_path} --fzf-preview {{2}}"
+
+    fzf_cmd = [
+        "fzf",
+        "--ansi",
+        "--header-lines=1",
+        "--layout=reverse",
+        "--border=rounded",
+        "--prompt=󰡨 Docker Explorer > ",
+        "--header=[Enter] View Logs  │  [Ctrl-S] Start  │  [Ctrl-T] Stop  │  [Ctrl-R] Restart  │  [Ctrl-E] Exec Shell  │  [Ctrl-K] Kill",
+        f"--preview={preview_cmd}",
+        "--preview-window=right:55%:wrap:border-rounded",
+        "--bind=shift-up:preview-up",
+        "--bind=shift-down:preview-down",
+        "--bind=page-up:preview-page-up",
+        "--bind=page-down:preview-page-down",
+        f"--bind=ctrl-s:execute(docker start {{2}} >/dev/null 2>&1 && notify-send 'Docker Manager' 'Started container {{2}}')+reload({script_path} --fzf-dump)",
+        f"--bind=ctrl-t:execute(docker stop {{2}} >/dev/null 2>&1 && notify-send 'Docker Manager' 'Stopped container {{2}}')+reload({script_path} --fzf-dump)",
+        f"--bind=ctrl-r:execute(docker restart {{2}} >/dev/null 2>&1 && notify-send 'Docker Manager' 'Restarted container {{2}}')+reload({script_path} --fzf-dump)",
+        f"--bind=ctrl-k:execute(docker kill {{2}} >/dev/null 2>&1 && notify-send 'Docker Manager' 'Killed container {{2}}')+reload({script_path} --fzf-dump)",
+        f"--bind=ctrl-u:reload({script_path} --fzf-dump)",
+        "--bind=ctrl-y:execute(echo -n {2} | wl-copy 2>/dev/null || echo -n {2} | xclip -sel clip 2>/dev/null)",
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            fzf_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True
+        )
+        selected_line, _ = proc.communicate(input="\n".join(lines))
+        if proc.returncode == 0 and selected_line.strip():
+            clean_line = ANSI_STRIP_REGEX.sub('', selected_line).strip()
+            tokens = clean_line.split()
+            if len(tokens) >= 2:
+                target_id = tokens[1]
+                # If dlog exists in same folder or PATH, launch dlog
+                dlog_path = os.path.join(os.path.dirname(script_path), "dlog")
+                if os.path.exists(dlog_path) and os.access(dlog_path, os.X_OK):
+                    os.execv(dlog_path, [dlog_path, target_id])
+                else:
+                    os.execvp("docker", ["docker", "logs", "-f", "--tail=100", target_id])
+    except KeyboardInterrupt:
+        pass
+
+def fzf_preview(container_id):
+    """
+    Renders detailed inspection and the latest 35 log lines for FZF preview pane.
+    """
+    inspect_container(container_id)
+    print(f"{BOLD}{ELECTRIC_CYAN}─── 󰈚 Recent Logs (tail 35) ──────────────────────────────────────{RESET}")
+    try:
+        proc = subprocess.run(["docker", "logs", "--tail=35", "--timestamps", container_id], capture_output=True, text=True)
+        logs = proc.stdout or proc.stderr
+        if logs.strip():
+            print(logs.strip())
+        else:
+            print(f"{GRAY}(No recent log entries){RESET}")
+    except Exception as e:
+        print(f"{RED}Error fetching logs: {e}{RESET}")
+
+def fzf_dump_lines():
+    containers = collect_containers(all_containers=True)
+    fzf_header = f"{BOLD}{ELECTRIC_CYAN}  {'NO':<4} {'ID':<12} {'STATE':<10} {'NAME':<28} {'STACK':<16} {'IMAGE':<24} PORTS{RESET}"
+    print(fzf_header)
+    for idx, c in enumerate(containers, 1):
+        print(f"  {idx:<4} {c['short_id']:<12} {c['state']:<10} {c['name']:<28} {(c['stack'] or '—'):<16} {c['image'][:23]:<24} {c['ports']}")
+
+# --- Main Entrypoint ---
+def main():
+    parser = argparse.ArgumentParser(
+        description="dps: Universal Smart, Fast & Beautiful Docker Container Explorer & Process Viewer",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("-a", "--all", action="store_true", default=True, help="Show all containers (default: True)")
+    parser.add_argument("-r", "--running", action="store_true", help="Show only running containers")
+    parser.add_argument("-s", "--stopped", "--exited", dest="stopped", action="store_true", help="Show only stopped/exited containers")
+    parser.add_argument("-p", "--project", "--stack", dest="project", help="Filter containers by Docker Compose project / stack")
+    parser.add_argument("-q", "--search", help="Search across container names, IDs, images, ports, or stacks")
+    parser.add_argument("-g", "--group", action="store_true", help="Group containers by Docker Compose project / stack")
+    parser.add_argument("-n", "--limit", type=int, default=None, help="Limit number of containers displayed")
+    parser.add_argument("-w", "--watch", nargs="?", const=2.0, type=float, help="Live auto-refresh watch dashboard with interval in seconds (default: 2.0s)")
+    parser.add_argument("-i", "--fzf", "--interactive", action="store_true", help="Launch interactive FZF container browser with live preview and controls")
+    parser.add_argument("-f", dest="fzf_alias", action="store_true", help="Alias for -i / --fzf")
+    parser.add_argument("--inspect", help="Display comprehensive inspection card for a specific container name or ID")
+    parser.add_argument("--sort", choices=["name", "status", "created", "image", "id", "stack", "project", "ports"], default="name", help="Sort containers by field (default: name)")
+    parser.add_argument("--asc", action="store_true", help="Sort in ascending order")
+    parser.add_argument("--desc", action="store_true", help="Sort in descending order")
+    parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    parser.add_argument("-c", "--color", choices=["auto", "always", "never"], default="auto", help="Color output mode (auto, always, never; default: auto)")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color output")
+    parser.add_argument("--fzf-dump", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--fzf-preview", help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    # Color configuration
+    if args.color == "never" or args.no_color:
+        disable_colors()
+    elif args.color == "always":
+        pass
+    elif not sys.stdout.isatty() and not (args.json or args.inspect or args.fzf_dump or args.fzf_preview):
+        disable_colors()
+
+    # FZF Internal triggers
+    if args.fzf_preview:
+        fzf_preview(args.fzf_preview)
+        return
+    if args.fzf_dump:
+        fzf_dump_lines()
+        return
+
+    # Consolidate fzf flag
+    if getattr(args, "fzf_alias", False):
+        args.fzf = True
+
+    # Single Container Inspect Mode
+    if args.inspect:
+        inspect_container(args.inspect)
+        return
+
+    reverse_sort = args.desc if args.desc else (not args.asc if args.sort in ["created", "status"] else False)
+
+    # Interactive FZF Mode
+    if args.fzf:
+        containers = collect_containers(
+            all_containers=not args.running,
+            search=args.search,
+            running_only=args.running,
+            stopped_only=args.stopped,
+            project=args.project,
+            sort_by=args.sort,
+            reverse=reverse_sort
+        )
+        run_fzf_mode(containers)
+        return
+
+    # Live Watch Dashboard Mode
+    if args.watch is not None:
+        interval = max(0.5, args.watch)
+        try:
+            while True:
+                containers = collect_containers(
+                    all_containers=not args.running,
+                    search=args.search,
+                    running_only=args.running,
+                    stopped_only=args.stopped,
+                    project=args.project,
+                    sort_by=args.sort,
+                    reverse=reverse_sort
+                )
+                print(f"{ESC}[2J{ESC}[H", end="", flush=True)
+                print_docker_header(containers, search=args.search, project=args.project, running_only=args.running, stopped_only=args.stopped)
+                
+                if args.group:
+                    groups = group_containers_by_stack(containers)
+                    render_grouped_table(groups, limit=args.limit)
+                else:
+                    render_table(containers, limit=args.limit)
+
+                print(f"\n{GRAY}  󰔛 Refreshing every {interval:.1f}s │ Press Ctrl+C to exit{RESET}", flush=True)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print(f"\n{GRAY}Exited live watch mode.{RESET}")
+            return
+
+    # Standard Execution
+    containers = collect_containers(
+        all_containers=not args.running,
+        search=args.search,
+        running_only=args.running,
+        stopped_only=args.stopped,
+        project=args.project,
+        sort_by=args.sort,
+        reverse=reverse_sort
+    )
+
+    if args.json:
+        payload = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "total": len(containers),
+            "running": sum(1 for c in containers if c["state"].lower() == "running"),
+            "exited": sum(1 for c in containers if c["state"].lower() == "exited"),
+            "paused": sum(1 for c in containers if c["state"].lower() == "paused"),
+            "results": containers if (args.limit is None) else containers[:args.limit]
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    print_docker_header(containers, search=args.search, project=args.project, running_only=args.running, stopped_only=args.stopped)
+    
+    if args.group:
+        groups = group_containers_by_stack(containers)
+        render_grouped_table(groups, limit=args.limit)
+    else:
+        render_table(containers, limit=args.limit)
+
+if __name__ == "__main__":
+    main()
