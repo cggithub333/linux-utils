@@ -29,7 +29,7 @@ A curated collection of standalone CLI utilities for Linux developer workstation
 - **Tmux-like Resizing**: Press `Alt+q` to toggle Resize Mode and use `←`/`→` or `h`/`l` to adjust pane widths (or directly use `Alt+←` and `Alt+→`).
 - **In-Preview Grep**: Press `Ctrl+f` or `/` in preview to activate an in-preview search box at the top right of the preview pane with `Enter`/`n` match navigation.
 - **Border-Free Shaded Code Blocks**: Markdown code blocks (` ```...``` `) are displayed inside a modern, borderless card with a solid dark gray background, language badge, and vibrant Chroma syntax highlighting with auto-wrapping for long lines.
-- **Trackpad Scroll Guard**: Mouse wheel and 2-finger trackpad scrolling are strictly silenced in Dual-Pane mode to prevent runaway inertia scrolling on file lists.
+- **Touchpad & Wheel Scrolling on Preview**: Mouse wheel and 2-finger trackpad smoothly scroll the Preview Box and Full-Screen Reader, while the File Explorer list remains strictly guarded against accidental inertia jumps.
 - **Persistent Configuration**: Saved automatically to `~/.deepmd/config.json`.
 
 ### CLI Usage
@@ -63,7 +63,7 @@ A curated collection of standalone CLI utilities for Linux developer workstation
 | `Leader` then `→` / `l` | Switch active focus to **Preview Box** |
 | `Leader` then `Alt+←` / `Alt+h` | Nudge divider left (shrinks file list, widens preview box) |
 | `Leader` then `Alt+→` / `Alt+l` | Nudge divider right (widens file list, narrows preview box) |
-| `Ctrl+p` / `Ctrl+y` | **Copy Filepath** to system clipboard |
+| `Ctrl+p` / `Ctrl+y` | **Copy Full Absolute Filepath** to system clipboard (when focused on file explorer) |
 | `Ctrl+a` | **Copy Full Content** to system clipboard (works for both file explorer and preview focus) |
 | `Ctrl+f` / `/` | Open / close in-preview grep search pill on the top right of Preview box |
 | `Tab` / `Enter` | **Traverse to next match** in preview grep (active match in magenta, other matches in gold/yellow) |
